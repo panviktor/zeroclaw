@@ -11,17 +11,16 @@ use matrix_sdk::{
         api::client::uiaa,
         events::{
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
-            relation::{Annotation, InReplyTo, Thread},
+            relation::{Annotation, Thread},
             room::{
                 message::{
-                    AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
                     LocationMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-                    RoomMessageEventContent,
+                    Relation, RoomMessageEventContent,
                 },
                 MediaSource,
             },
         },
-        OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId,
+        OwnedEventId, OwnedRoomId, OwnedUserId,
     },
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
@@ -328,7 +327,7 @@ async fn download_and_save_matrix_media(
 ) -> anyhow::Result<PathBuf> {
     // Pre-download size check using event metadata (avoids buffering large payloads).
     if let Some(size) = size_hint {
-        if size as usize > max_bytes {
+        if usize::try_from(size).unwrap_or(usize::MAX) > max_bytes {
             anyhow::bail!(
                 "Matrix media metadata size exceeds limit ({size} bytes > {max_bytes} bytes); skipping download",
             );
@@ -810,7 +809,7 @@ impl MatrixChannel {
                     resolved_user_id = response.user_id.to_string();
                     tracing::info!(
                         "Matrix: logged in with password (device_id={})",
-                        crate::security::redact(&response.device_id.to_string())
+                        crate::security::redact(response.device_id.as_str())
                     );
 
                     // Persist session.json so future runs use Path 1 (no password needed).
@@ -1213,13 +1212,8 @@ impl Channel for MatrixChannel {
             parse_matrix_attachment_markers(&after_locations);
 
         let client = self.matrix_client().await?;
-        let target_room_id = if message.recipient.contains("||") {
-            message
-                .recipient
-                .splitn(2, "||")
-                .nth(1)
-                .unwrap()
-                .to_string()
+        let target_room_id = if let Some((_, room)) = message.recipient.split_once("||") {
+            room.to_string()
         } else {
             self.target_room_id().await?
         };
@@ -1348,12 +1342,8 @@ impl Channel for MatrixChannel {
                 _ => AttachmentConfig::new(),
             };
 
-            match room.send_attachment(&filename, &mime, bytes, config).await {
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!("Matrix media send failed for '{}': {error}", path.display());
-                    continue;
-                }
+            if let Err(error) = room.send_attachment(&filename, &mime, bytes, config).await {
+                tracing::warn!("Matrix media send failed for '{}': {error}", path.display());
             }
         }
 
@@ -1474,12 +1464,9 @@ impl Channel for MatrixChannel {
         )));
 
         let tx_handler = tx.clone();
-        let target_room_for_handler = target_room.clone();
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
-        let homeserver_for_handler = self.homeserver.clone();
-        let access_token_for_handler = self.access_token.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
         let media_save_dir_for_handler = self.media_save_dir();
         let transcription_for_handler = self.transcription.clone();
@@ -1488,12 +1475,9 @@ impl Channel for MatrixChannel {
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
-            let target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
-            let homeserver = homeserver_for_handler.clone();
-            let access_token = access_token_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
             let media_save_dir = media_save_dir_for_handler.clone();
             let transcription_config = transcription_for_handler.clone();
@@ -1588,7 +1572,7 @@ impl Channel for MatrixChannel {
 
                         // Pre-download size check for audio.
                         if let Some(size) = size_hint {
-                            if size as usize > max_media_bytes {
+                            if usize::try_from(size).unwrap_or(usize::MAX) > max_media_bytes {
                                 tracing::warn!("Matrix audio exceeds size limit ({size} bytes); skipping");
                                 return;
                             }
@@ -1969,7 +1953,7 @@ impl Channel for MatrixChannel {
         let resp = self
             .http_client
             .get(&url)
-            .header("Authorization", self.auth_header_value())
+            .header("Authorization", self.auth_header_value().await?)
             .send()
             .await?;
 
@@ -2001,7 +1985,7 @@ impl Channel for MatrixChannel {
         let resp = self
             .http_client
             .put(&put_url)
-            .header("Authorization", self.auth_header_value())
+            .header("Authorization", self.auth_header_value().await?)
             .json(&body)
             .send()
             .await?;
@@ -2025,7 +2009,7 @@ impl Channel for MatrixChannel {
         let resp = self
             .http_client
             .get(&url)
-            .header("Authorization", self.auth_header_value())
+            .header("Authorization", self.auth_header_value().await?)
             .send()
             .await?;
 
@@ -2060,7 +2044,7 @@ impl Channel for MatrixChannel {
         let resp = self
             .http_client
             .put(&put_url)
-            .header("Authorization", self.auth_header_value())
+            .header("Authorization", self.auth_header_value().await?)
             .json(&body)
             .send()
             .await?;
