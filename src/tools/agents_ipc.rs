@@ -579,6 +579,145 @@ impl Tool for StateSetTool {
     }
 }
 
+// ── AgentsSpawnTool ──────────────────────────────────────────────
+
+/// Tool for spawning a new agent process via the cron scheduler.
+///
+/// This is a local tool — it does not use the IPC HTTP client. Instead it
+/// creates a one-shot cron job that runs immediately. Trust propagation:
+/// child trust_level >= parent trust_level (cannot escalate).
+pub struct AgentsSpawnTool {
+    config: Arc<crate::config::Config>,
+    security: Arc<crate::security::SecurityPolicy>,
+    parent_trust_level: u8,
+}
+
+impl AgentsSpawnTool {
+    pub fn new(
+        config: Arc<crate::config::Config>,
+        security: Arc<crate::security::SecurityPolicy>,
+        parent_trust_level: u8,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            parent_trust_level,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for AgentsSpawnTool {
+    fn name(&self) -> &str {
+        "agents_spawn"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn a new agent process with a given prompt. The child agent runs as a \
+         one-shot cron job and inherits your trust level or lower. You cannot spawn \
+         agents with higher trust than your own."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "System prompt / instructions for the spawned agent"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Human-readable name for the spawned agent (optional)"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model to use (optional, defaults to parent's model)"
+                },
+                "trust_level": {
+                    "type": "integer",
+                    "description": "Trust level for child (0-4). Must be >= parent's level. Default: parent's level."
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Security check
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Security policy denied spawn".into()),
+            });
+        }
+
+        let prompt = args["prompt"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+        let name = args["name"].as_str().map(String::from);
+        let model = args["model"].as_str().map(String::from);
+        let requested_level = args["trust_level"]
+            .as_u64()
+            .and_then(|v| u8::try_from(v).ok());
+
+        // Trust propagation: child >= parent
+        let child_level = requested_level
+            .map(|r| r.max(self.parent_trust_level))
+            .unwrap_or(self.parent_trust_level);
+
+        if let Some(requested) = requested_level {
+            if requested < self.parent_trust_level {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Cannot escalate: requested trust L{requested} but parent is L{}. \
+                         Child will be L{child_level} at minimum.",
+                        self.parent_trust_level
+                    )),
+                });
+            }
+        }
+
+        // Create one-shot job that fires ~1 second from now
+        let run_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let schedule = crate::cron::Schedule::At { at: run_at };
+
+        let job_name = name.unwrap_or_else(|| format!("ipc-spawn-L{child_level}"));
+        let spawn_prompt = format!("[IPC spawned agent | trust_level={child_level}]\n\n{prompt}");
+
+        match crate::cron::add_agent_job(
+            &self.config,
+            Some(job_name.clone()),
+            schedule,
+            &spawn_prompt,
+            crate::cron::SessionTarget::Isolated,
+            model,
+            None, // delivery
+            true, // delete_after_run
+        ) {
+            Ok(job) => Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&json!({
+                    "spawned": true,
+                    "job_id": job.id,
+                    "name": job_name,
+                    "trust_level": child_level,
+                    "next_run": job.next_run.to_rfc3339(),
+                }))?,
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to spawn agent: {e}")),
+            }),
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -645,6 +784,17 @@ mod tests {
         assert_eq!(spec.name, "state_get");
         let required = spec.parameters["required"].as_array().unwrap();
         assert!(required.contains(&json!("key")));
+    }
+
+    #[test]
+    fn agents_spawn_tool_spec() {
+        let config = Arc::new(crate::config::Config::default());
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let tool = AgentsSpawnTool::new(config, security, 2);
+        let spec = tool.spec();
+        assert_eq!(spec.name, "agents_spawn");
+        let required = spec.parameters["required"].as_array().unwrap();
+        assert!(required.contains(&json!("prompt")));
     }
 
     #[test]
