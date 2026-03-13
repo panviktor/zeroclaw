@@ -532,9 +532,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
-    let pairing = Arc::new(PairingGuard::new(
+    let pairing = Arc::new(PairingGuard::with_metadata(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
+        &config.gateway.token_metadata,
     ));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
@@ -831,10 +832,12 @@ async fn handle_pair(
 
 async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
+    let token_metadata = pairing.token_metadata();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
     let mut updated_cfg = { config.lock().clone() };
     updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg.gateway.token_metadata = token_metadata;
     updated_cfg
         .save()
         .await
@@ -1610,15 +1613,50 @@ async fn handle_admin_paircode(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// Optional body for `POST /admin/paircode/new` to bind IPC metadata to the new code.
+#[derive(Debug, serde::Deserialize)]
+struct PaircodeNewBody {
+    agent_id: String,
+    #[serde(default = "default_paircode_trust_level")]
+    trust_level: u8,
+    #[serde(default = "default_paircode_role")]
+    role: String,
+}
+
+fn default_paircode_trust_level() -> u8 {
+    3
+}
+
+fn default_paircode_role() -> String {
+    "agent".into()
+}
+
 /// POST /admin/paircode/new — generate a new pairing code (localhost only)
+///
+/// Accepts an optional JSON body with `agent_id`, `trust_level`, and `role`
+/// to bind IPC metadata to the pairing code. When the code is used to pair,
+/// the resulting token inherits this metadata. Without a body, the code
+/// produces a legacy human token (no IPC access).
 async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Option<Json<PaircodeNewBody>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
     match state.pairing.generate_new_pairing_code() {
         Some(code) => {
-            tracing::info!("🔐 New pairing code generated via admin endpoint");
+            // If metadata was provided, bind it to the pairing code
+            if let Some(Json(meta_body)) = body {
+                let metadata = crate::config::TokenMetadata {
+                    agent_id: meta_body.agent_id,
+                    trust_level: meta_body.trust_level,
+                    role: meta_body.role,
+                };
+                state.pairing.set_pending_metadata(&code, metadata);
+                tracing::info!("🔐 New IPC pairing code generated via admin endpoint");
+            } else {
+                tracing::info!("🔐 New pairing code generated via admin endpoint");
+            }
             let body = serde_json::json!({
                 "success": true,
                 "pairing_required": state.pairing.require_pairing(),

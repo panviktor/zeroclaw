@@ -12,7 +12,7 @@ Execution owner: `Opus`
 | # | Step | Files | Status | Depends on |
 |---|------|-------|--------|------------|
 | 1 | Config: AgentsIpcConfig + schema | config/schema.rs, config/mod.rs | DONE (2026-03-13) | — |
-| 2 | Pairing: TokenMetadata + authenticate() | security/pairing.rs | TODO | 1 |
+| 2 | Pairing: TokenMetadata + authenticate() | security/pairing.rs | DONE (2026-03-13) | 1 |
 | 3 | Gateway plumbing: AppState + routes + IpcDb init | gateway/mod.rs, gateway/api.rs | TODO | 1, 2 |
 | 4 | Broker core: IpcDb + schema + ACL | gateway/ipc.rs (new) | TODO | 3 |
 | 5 | Broker handlers: send, inbox, agents_list | gateway/ipc.rs | TODO | 4 |
@@ -59,7 +59,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo check`, existing pairing tests pass, no breaking changes to API responses
 
-**Notes**: —
+**Notes**: Also updated gateway: persist_pairing_tokens saves metadata, handle_admin_paircode_new accepts optional body, startup uses with_metadata(). 7 new tests. Commit: `343b2bc3` on `feat/ipc-pairing`.
 
 ---
 
