@@ -85,12 +85,12 @@ recommended_tests() {
   echo "## Required Reviewers"
   echo
   echo "- Opus"
-  echo "- Additional security/architecture review if any `shared-hotspot` path touches auth, approval, pairing, gateway or channels"
+  echo '- Additional security/architecture review if any `shared-hotspot` path touches auth, approval, pairing, gateway or channels'
   echo
   echo "## Notes"
   echo
   echo "- Re-run fork invariants after conflict resolution"
-  echo "- Update `fork-delta.md` if a hotspot boundary changed"
+  echo '- Update `fork-delta.md` if a hotspot boundary changed'
   echo "- If upstream semantics changed in shared-hotspot files, prefer restoring fork behavior through isolated hooks instead of deeper patching"
 } > "$OUTPUT_PATH"
 
