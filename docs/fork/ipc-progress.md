@@ -13,7 +13,7 @@ Execution owner: `Opus`
 |---|------|-------|--------|------------|
 | 1 | Config: AgentsIpcConfig + schema | config/schema.rs, config/mod.rs | DONE (2026-03-13) | — |
 | 2 | Pairing: TokenMetadata + authenticate() | security/pairing.rs | DONE (2026-03-13) | 1 |
-| 3 | Gateway plumbing: AppState + routes + IpcDb init | gateway/mod.rs, gateway/api.rs | TODO | 1, 2 |
+| 3 | Gateway plumbing: AppState + routes + IpcDb init | gateway/mod.rs, gateway/api.rs, gateway/ipc.rs | DONE (2026-03-13) | 1, 2 |
 | 4 | Broker core: IpcDb + schema + ACL | gateway/ipc.rs (new) | TODO | 3 |
 | 5 | Broker handlers: send, inbox, agents_list | gateway/ipc.rs | TODO | 4 |
 | 6 | Broker handlers: state_get, state_set | gateway/ipc.rs | TODO | 4 |
