@@ -104,24 +104,47 @@ impl IpcDb {
     }
 
     /// Upsert agent record and update `last_seen` timestamp.
+    ///
+    /// Does NOT overwrite status if the agent has been revoked, disabled, or
+    /// quarantined — admin kill-switches are authoritative.
     pub fn update_last_seen(&self, agent_id: &str, trust_level: u8, role: &str) {
         let now = unix_now();
         let conn = self.conn.lock();
         let _ = conn.execute(
-            "INSERT INTO agents (agent_id, trust_level, role, last_seen)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO agents (agent_id, trust_level, role, last_seen, status)
+             VALUES (?1, ?2, ?3, ?4, 'online')
              ON CONFLICT(agent_id) DO UPDATE SET
-                trust_level = ?2, role = ?3, last_seen = ?4, status = 'online'",
+                trust_level = ?2, role = ?3, last_seen = ?4",
             params![agent_id, trust_level, role, now],
         );
     }
 
-    /// Check whether a session contains a task directed at the given agent.
-    pub fn session_has_task_for(&self, session_id: &str, agent_id: &str) -> bool {
+    /// Check whether an agent is blocked (revoked, disabled, or quarantined).
+    pub fn is_agent_blocked(&self, agent_id: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT status FROM agents WHERE agent_id = ?1",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|status| match status.as_str() {
+            "revoked" | "disabled" | "quarantined" => Some(status),
+            _ => None,
+        })
+    }
+
+    /// Check whether a session contains a task or query directed at the given agent.
+    ///
+    /// A `result` message is valid as a reply to either a `task` or a `query`
+    /// in the same session. This enables both parent→child task flows and
+    /// peer-to-peer query→result flows (e.g. Research↔Code, Sentinel↔DevOps).
+    pub fn session_has_request_for(&self, session_id: &str, agent_id: &str) -> bool {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT COUNT(*) FROM messages
-             WHERE session_id = ?1 AND to_agent = ?2 AND kind = 'task' AND blocked = 0",
+             WHERE session_id = ?1 AND to_agent = ?2
+               AND kind IN ('task', 'query') AND blocked = 0",
             params![session_id, agent_id],
             |row| row.get::<_, i64>(0),
         )
@@ -196,13 +219,13 @@ impl IpcDb {
             "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?1",
             params![now],
         );
-        let min_trust = if include_quarantine { 0 } else { -1 };
-        let _ = min_trust; // quarantine = from_trust_level >= 4
+        // quarantine=false: normal inbox (from_trust_level < 4)
+        // quarantine=true: quarantine review lane (ONLY from_trust_level >= 4)
         let query = if include_quarantine {
             "SELECT id, session_id, from_agent, to_agent, kind, payload, priority,
                     from_trust_level, seq, created_at
              FROM messages
-             WHERE to_agent = ?1 AND read = 0 AND blocked = 0
+             WHERE to_agent = ?1 AND read = 0 AND blocked = 0 AND from_trust_level >= 4
              ORDER BY priority DESC, created_at ASC
              LIMIT ?2"
         } else {
@@ -510,14 +533,14 @@ pub fn validate_send(
         });
     }
 
-    // Rule 3: result requires correlated task
+    // Rule 3: result requires correlated task or query
     if kind == "result" {
         match session_id {
-            Some(sid) if db.session_has_task_for(sid, from_agent) => {}
+            Some(sid) if db.session_has_request_for(sid, from_agent) => {}
             _ => {
                 return Err(IpcError {
                     status: StatusCode::FORBIDDEN,
-                    error: "Result requires a correlated task in the same session".into(),
+                    error: "Result requires a correlated task or query in the same session".into(),
                     code: "result_no_task".into(),
                     retryable: false,
                 });
@@ -727,16 +750,22 @@ pub async fn handle_ipc_agents(
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
+    require_agent_active(db, &meta.agent_id)?;
 
     let staleness = state.config.lock().agents_ipc.staleness_secs;
     let agents = db.list_agents(staleness);
 
-    // L4 agents only see their configured destinations
-    let agents = if meta.trust_level >= 4 {
+    // L4 agents only see their configured destinations with masked metadata
+    let agents: Vec<AgentInfo> = if meta.trust_level >= 4 {
         let l4_dests = &state.config.lock().agents_ipc.l4_destinations;
         agents
             .into_iter()
             .filter(|a| l4_dests.contains(&a.agent_id))
+            .map(|a| AgentInfo {
+                role: None,
+                trust_level: 0, // masked
+                ..a
+            })
             .collect()
     } else {
         agents
@@ -754,15 +783,24 @@ pub async fn handle_ipc_send(
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
+    require_agent_active(db, &meta.agent_id)?;
 
-    // Resolve recipient trust level
+    // Resolve recipient trust level — reject unknown recipients
     let config = state.config.lock();
     let to_level = db
         .list_agents(config.agents_ipc.staleness_secs)
         .iter()
         .find(|a| a.agent_id == body.to)
         .map(|a| a.trust_level)
-        .unwrap_or(3); // default to L3 for unknown agents
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Unknown recipient agent",
+                    "code": "unknown_recipient"
+                })),
+            )
+        })?;
 
     // ACL check
     validate_send(
@@ -823,6 +861,7 @@ pub async fn handle_ipc_inbox(
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
+    require_agent_active(db, &meta.agent_id)?;
 
     let messages = db.fetch_inbox(&meta.agent_id, query.quarantine, query.limit);
 
@@ -838,6 +877,7 @@ pub async fn handle_ipc_state_get(
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
+    require_agent_active(db, &meta.agent_id)?;
 
     validate_state_get(meta.trust_level, &query.key)
         .map_err(|e| e.into_response_pair(meta.trust_level))?;
@@ -855,6 +895,7 @@ pub async fn handle_ipc_state_set(
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
+    require_agent_active(db, &meta.agent_id)?;
 
     validate_state_set(meta.trust_level, &meta.agent_id, &body.key)
         .map_err(|e| e.into_response_pair(meta.trust_level))?;
@@ -965,6 +1006,23 @@ pub async fn handle_admin_ipc_downgrade(
 
 fn require_ipc_db(state: &AppState) -> Result<&Arc<IpcDb>, (StatusCode, Json<serde_json::Value>)> {
     state.ipc_db.as_ref().ok_or_else(ipc_disabled_error)
+}
+
+/// Reject requests from agents whose status is revoked, disabled, or quarantined.
+fn require_agent_active(
+    db: &IpcDb,
+    agent_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(status) = db.is_agent_blocked(agent_id) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("Agent is {status}"),
+                "code": "agent_blocked"
+            })),
+        ));
+    }
+    Ok(())
 }
 
 fn ipc_disabled_error() -> (StatusCode, Json<serde_json::Value>) {
@@ -1207,13 +1265,13 @@ mod tests {
     // ── IpcDb tests ─────────────────────────────────────────────
 
     #[test]
-    fn session_has_task_for_false() {
+    fn session_has_request_for_false() {
         let db = test_db();
-        assert!(!db.session_has_task_for("s1", "worker"));
+        assert!(!db.session_has_request_for("s1", "worker"));
     }
 
     #[test]
-    fn session_has_task_for_true() {
+    fn session_has_request_for_true() {
         let db = test_db();
         let conn = db.conn.lock();
         conn.execute(
@@ -1224,11 +1282,11 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        assert!(db.session_has_task_for("s1", "worker"));
+        assert!(db.session_has_request_for("s1", "worker"));
     }
 
     #[test]
-    fn session_has_task_for_blocked_ignored() {
+    fn session_has_request_for_blocked_ignored() {
         let db = test_db();
         let conn = db.conn.lock();
         conn.execute(
@@ -1239,7 +1297,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        assert!(!db.session_has_task_for("s1", "worker"));
+        assert!(!db.session_has_request_for("s1", "worker"));
     }
 
     #[test]
@@ -1289,14 +1347,14 @@ mod tests {
             .unwrap();
         assert!(id > 0);
 
-        let messages = db.fetch_inbox("worker", true, 50);
+        let messages = db.fetch_inbox("worker", false, 50);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].from_agent, "opus");
         assert_eq!(messages[0].kind, "task");
         assert_eq!(messages[0].payload, "do something");
 
         // Second fetch should return empty (marked as read)
-        let messages2 = db.fetch_inbox("worker", true, 50);
+        let messages2 = db.fetch_inbox("worker", false, 50);
         assert!(messages2.is_empty());
     }
 
@@ -1315,15 +1373,22 @@ mod tests {
     }
 
     #[test]
-    fn fetch_inbox_includes_quarantine() {
+    fn fetch_inbox_quarantine_is_isolated_lane() {
         let db = test_db();
         db.insert_message("kids", "opus", "text", "hello", 4, None, 0, None)
             .unwrap();
         db.insert_message("worker", "opus", "text", "report", 3, None, 0, None)
             .unwrap();
 
-        let messages = db.fetch_inbox("opus", true, 50);
-        assert_eq!(messages.len(), 2);
+        // quarantine=true returns ONLY L4 messages (isolated lane)
+        let quarantine = db.fetch_inbox("opus", true, 50);
+        assert_eq!(quarantine.len(), 1);
+        assert_eq!(quarantine[0].from_trust_level, 4);
+
+        // quarantine=false returns ONLY non-L4 messages
+        let normal = db.fetch_inbox("opus", false, 50);
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].from_trust_level, 3);
     }
 
     #[test]
@@ -1382,6 +1447,155 @@ mod tests {
         // Downgrade (2 → 3) should succeed
         let old = db.set_agent_trust_level("worker", 3);
         assert_eq!(old, Some(2));
+    }
+
+    // ── Fix #1: admin kill-switch effectiveness ──────────────────
+
+    #[test]
+    fn update_last_seen_does_not_reset_revoked_status() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        db.set_agent_status("worker", "revoked");
+
+        // Subsequent update_last_seen must NOT reset to online
+        db.update_last_seen("worker", 3, "agent");
+
+        let agents = db.list_agents(120);
+        let worker = agents.iter().find(|a| a.agent_id == "worker").unwrap();
+        assert_eq!(worker.status, "revoked");
+    }
+
+    #[test]
+    fn update_last_seen_does_not_reset_disabled_status() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        db.set_agent_status("worker", "disabled");
+
+        db.update_last_seen("worker", 3, "agent");
+
+        let agents = db.list_agents(120);
+        let worker = agents.iter().find(|a| a.agent_id == "worker").unwrap();
+        assert_eq!(worker.status, "disabled");
+    }
+
+    #[test]
+    fn update_last_seen_does_not_reset_quarantined_status() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        db.set_agent_status("worker", "quarantined");
+
+        db.update_last_seen("worker", 3, "agent");
+
+        let agents = db.list_agents(120);
+        let worker = agents.iter().find(|a| a.agent_id == "worker").unwrap();
+        assert_eq!(worker.status, "quarantined");
+    }
+
+    #[test]
+    fn is_agent_blocked_detects_revoked() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        assert!(db.is_agent_blocked("worker").is_none());
+
+        db.set_agent_status("worker", "revoked");
+        assert_eq!(db.is_agent_blocked("worker").as_deref(), Some("revoked"));
+    }
+
+    #[test]
+    fn is_agent_blocked_detects_disabled() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        db.set_agent_status("worker", "disabled");
+        assert_eq!(db.is_agent_blocked("worker").as_deref(), Some("disabled"));
+    }
+
+    #[test]
+    fn is_agent_blocked_detects_quarantined() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        db.set_agent_status("worker", "quarantined");
+        assert_eq!(
+            db.is_agent_blocked("worker").as_deref(),
+            Some("quarantined")
+        );
+    }
+
+    #[test]
+    fn is_agent_blocked_returns_none_for_online() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        assert!(db.is_agent_blocked("worker").is_none());
+    }
+
+    #[test]
+    fn is_agent_blocked_returns_none_for_unknown() {
+        let db = test_db();
+        assert!(db.is_agent_blocked("nonexistent").is_none());
+    }
+
+    // ── Fix #2: query→result correlation ────────────────────────
+
+    #[test]
+    fn session_has_request_for_query() {
+        let db = test_db();
+        let conn = db.conn.lock();
+        conn.execute(
+            "INSERT INTO messages (session_id, from_agent, to_agent, kind, payload,
+             from_trust_level, seq, created_at)
+             VALUES ('s1', 'research', 'code', 'query', 'what API?', 2, 1, 100)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        // code received a query in session s1 → can send result back
+        assert!(db.session_has_request_for("s1", "code"));
+    }
+
+    #[test]
+    fn validate_send_result_after_query_ok() {
+        let db = test_db();
+        // research sends query to code in session s1
+        db.insert_message(
+            "research",
+            "code",
+            "query",
+            "what API?",
+            2,
+            Some("s1"),
+            0,
+            None,
+        )
+        .unwrap();
+        // code replies with result → should be allowed
+        let result = validate_send(
+            2,
+            2,
+            "result",
+            "code",
+            "research",
+            Some("s1"),
+            &[],
+            &[],
+            &db,
+        );
+        assert!(result.is_ok());
+    }
+
+    // ── Fix #4: quarantine inbox isolation ──────────────────────
+
+    #[test]
+    fn fetch_inbox_quarantine_only_l4() {
+        let db = test_db();
+        db.insert_message("kids", "opus", "text", "hello", 4, None, 0, None)
+            .unwrap();
+        db.insert_message("worker", "opus", "text", "report", 3, None, 0, None)
+            .unwrap();
+
+        // quarantine=true should ONLY show L4 messages
+        let messages = db.fetch_inbox("opus", true, 50);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from_agent, "kids");
+        assert_eq!(messages[0].from_trust_level, 4);
     }
 
     #[test]
