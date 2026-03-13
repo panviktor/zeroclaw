@@ -4,23 +4,23 @@
 //! tokens, and the broker resolves trust levels from token metadata. The broker
 //! owns the SQLite database — agents never access it directly.
 
-use super::AppState;
+use super::{require_localhost, AppState};
 use crate::config::TokenMetadata;
 use crate::gateway::api::extract_bearer_token;
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-// tracing::{info, warn} will be used in Steps 5-7 when handlers are fleshed out
+use tracing::{info, warn};
 
 // ── IpcDb (broker-owned SQLite) ─────────────────────────────────
 
@@ -145,6 +145,294 @@ impl IpcDb {
         )
         .unwrap_or(1)
     }
+
+    /// Insert a message into the database.
+    pub fn insert_message(
+        &self,
+        from_agent: &str,
+        to_agent: &str,
+        kind: &str,
+        payload: &str,
+        from_trust_level: u8,
+        session_id: Option<&str>,
+        priority: i32,
+        message_ttl_secs: Option<u64>,
+    ) -> Result<i64, rusqlite::Error> {
+        let now = unix_now();
+        let seq = self.next_seq(from_agent);
+        let expires_at = message_ttl_secs.map(|ttl| now + ttl as i64);
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO messages (session_id, from_agent, to_agent, kind, payload,
+             priority, from_trust_level, seq, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session_id,
+                from_agent,
+                to_agent,
+                kind,
+                payload,
+                priority,
+                from_trust_level,
+                seq,
+                now,
+                expires_at
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Fetch unread messages for an agent, optionally including quarantine.
+    pub fn fetch_inbox(
+        &self,
+        agent_id: &str,
+        include_quarantine: bool,
+        limit: u32,
+    ) -> Vec<InboxMessage> {
+        let now = unix_now();
+        let conn = self.conn.lock();
+        // Lazy TTL cleanup
+        let _ = conn.execute(
+            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?1",
+            params![now],
+        );
+        let min_trust = if include_quarantine { 0 } else { -1 };
+        let _ = min_trust; // quarantine = from_trust_level >= 4
+        let query = if include_quarantine {
+            "SELECT id, session_id, from_agent, to_agent, kind, payload, priority,
+                    from_trust_level, seq, created_at
+             FROM messages
+             WHERE to_agent = ?1 AND read = 0 AND blocked = 0
+             ORDER BY priority DESC, created_at ASC
+             LIMIT ?2"
+        } else {
+            "SELECT id, session_id, from_agent, to_agent, kind, payload, priority,
+                    from_trust_level, seq, created_at
+             FROM messages
+             WHERE to_agent = ?1 AND read = 0 AND blocked = 0 AND from_trust_level < 4
+             ORDER BY priority DESC, created_at ASC
+             LIMIT ?2"
+        };
+        let mut stmt = match conn.prepare(query) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt
+            .query_map(params![agent_id, limit], |row| {
+                Ok(InboxMessage {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    from_agent: row.get(2)?,
+                    to_agent: row.get(3)?,
+                    kind: row.get(4)?,
+                    payload: row.get(5)?,
+                    priority: row.get(6)?,
+                    from_trust_level: row.get(7)?,
+                    seq: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })
+            .ok();
+        let messages: Vec<InboxMessage> = rows
+            .map(|r| r.filter_map(|m| m.ok()).collect())
+            .unwrap_or_default();
+        // Mark as read
+        let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
+        for id in &ids {
+            let _ = conn.execute("UPDATE messages SET read = 1 WHERE id = ?1", params![id]);
+        }
+        messages
+    }
+
+    /// List known agents with staleness check.
+    pub fn list_agents(&self, staleness_secs: u64) -> Vec<AgentInfo> {
+        let now = unix_now();
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT agent_id, role, trust_level, status, last_seen FROM agents ORDER BY agent_id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| {
+            let last_seen: Option<i64> = row.get(4)?;
+            let status: String = row.get(3)?;
+            let effective_status = if status == "online" {
+                match last_seen {
+                    Some(ts) if (now - ts) > staleness_secs as i64 => "stale".to_string(),
+                    _ => status,
+                }
+            } else {
+                status
+            };
+            Ok(AgentInfo {
+                agent_id: row.get(0)?,
+                role: row.get(1)?,
+                trust_level: row.get(2)?,
+                status: effective_status,
+                last_seen,
+            })
+        })
+        .ok()
+        .map(|r| r.filter_map(|a| a.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Get a shared state value.
+    pub fn get_state(&self, key: &str) -> Option<StateEntry> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT key, value, owner, updated_at FROM shared_state WHERE key = ?1",
+            params![key],
+            |row| {
+                Ok(StateEntry {
+                    key: row.get(0)?,
+                    value: row.get(1)?,
+                    owner: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// Upsert a shared state value.
+    pub fn set_state(&self, key: &str, value: &str, owner: &str) {
+        let now = unix_now();
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "INSERT INTO shared_state (key, value, owner, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(key) DO UPDATE SET value = ?2, owner = ?3, updated_at = ?4",
+            params![key, value, owner, now],
+        );
+    }
+
+    /// Set agent status (for admin disable/quarantine).
+    pub fn set_agent_status(&self, agent_id: &str, status: &str) -> bool {
+        let conn = self.conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE agents SET status = ?2 WHERE agent_id = ?1",
+                params![agent_id, status],
+            )
+            .unwrap_or(0);
+        changed > 0
+    }
+
+    /// Set agent trust level (for admin downgrade).
+    pub fn set_agent_trust_level(&self, agent_id: &str, new_level: u8) -> Option<u8> {
+        let conn = self.conn.lock();
+        let current: u8 = conn
+            .query_row(
+                "SELECT trust_level FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .ok()?;
+        // Can only downgrade (increase number)
+        if new_level <= current {
+            return None;
+        }
+        conn.execute(
+            "UPDATE agents SET trust_level = ?2 WHERE agent_id = ?1",
+            params![agent_id, new_level],
+        )
+        .ok();
+        Some(current)
+    }
+
+    /// Block pending messages for an agent (used by revoke/disable).
+    pub fn block_pending_messages(&self, agent_id: &str, reason: &str) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "UPDATE messages SET blocked = 1, block_reason = ?2
+             WHERE to_agent = ?1 AND read = 0 AND blocked = 0",
+            params![agent_id, reason],
+        );
+    }
+}
+
+// ── Request/Response types ──────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SendBody {
+    pub to: String,
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    pub payload: String,
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub priority: i32,
+}
+
+fn default_kind() -> String {
+    "text".into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InboxQuery {
+    #[serde(default)]
+    pub quarantine: bool,
+    #[serde(default = "default_inbox_limit")]
+    pub limit: u32,
+}
+
+fn default_inbox_limit() -> u32 {
+    50
+}
+
+#[derive(Debug, Serialize)]
+pub struct InboxMessage {
+    pub id: i64,
+    pub session_id: Option<String>,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub kind: String,
+    pub payload: String,
+    pub priority: i32,
+    pub from_trust_level: u8,
+    pub seq: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentInfo {
+    pub agent_id: String,
+    pub role: Option<String>,
+    pub trust_level: u8,
+    pub status: String,
+    pub last_seen: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateGetQuery {
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateSetBody {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StateEntry {
+    pub key: String,
+    pub value: String,
+    pub owner: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminAgentBody {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminDowngradeBody {
+    pub agent_id: String,
+    pub new_level: u8,
 }
 
 // ── ACL validation ──────────────────────────────────────────────
@@ -407,21 +695,29 @@ pub struct IpcError {
 
 impl IpcError {
     fn into_response_pair(self, caller_trust: u8) -> (StatusCode, Json<serde_json::Value>) {
-        let mut body = serde_json::json!({
-            "error": if caller_trust <= 2 { &self.error } else { "Forbidden" },
-            "code": self.code,
-            "retryable": self.retryable,
-        });
-        // Only L1-L2 get detailed error messages
-        if caller_trust > 2 {
-            body.as_object_mut().unwrap().remove("error").ok_or(()).ok();
-            body["error"] = serde_json::json!("Forbidden");
+        if caller_trust <= 2 {
+            (
+                self.status,
+                Json(serde_json::json!({
+                    "error": self.error,
+                    "code": self.code,
+                    "retryable": self.retryable,
+                })),
+            )
+        } else {
+            (
+                self.status,
+                Json(serde_json::json!({
+                    "error": "Forbidden",
+                    "code": self.code,
+                    "retryable": self.retryable,
+                })),
+            )
         }
-        (self.status, Json(body))
     }
 }
 
-// ── IPC endpoint handlers (stubs) ───────────────────────────────
+// ── IPC endpoint handlers ───────────────────────────────────────
 
 /// GET /api/ipc/agents — list known agents with their status and trust level.
 pub async fn handle_ipc_agents(
@@ -431,100 +727,238 @@ pub async fn handle_ipc_agents(
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
-    Ok(Json(serde_json::json!({ "agents": [] })))
+
+    let staleness = state.config.lock().agents_ipc.staleness_secs;
+    let agents = db.list_agents(staleness);
+
+    // L4 agents only see their configured destinations
+    let agents = if meta.trust_level >= 4 {
+        let l4_dests = &state.config.lock().agents_ipc.l4_destinations;
+        agents
+            .into_iter()
+            .filter(|a| l4_dests.contains(&a.agent_id))
+            .collect()
+    } else {
+        agents
+    };
+
+    Ok(Json(serde_json::json!({ "agents": agents })))
 }
 
 /// POST /api/ipc/send — send a message to another agent via the broker.
 pub async fn handle_ipc_send(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(_body): Json<serde_json::Value>,
+    Json(body): Json<SendBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
-    Ok(Json(serde_json::json!({ "ok": true })))
+
+    // Resolve recipient trust level
+    let config = state.config.lock();
+    let to_level = db
+        .list_agents(config.agents_ipc.staleness_secs)
+        .iter()
+        .find(|a| a.agent_id == body.to)
+        .map(|a| a.trust_level)
+        .unwrap_or(3); // default to L3 for unknown agents
+
+    // ACL check
+    validate_send(
+        meta.trust_level,
+        to_level,
+        &body.kind,
+        &meta.agent_id,
+        &body.to,
+        body.session_id.as_deref(),
+        &config.agents_ipc.lateral_text_pairs,
+        &config.agents_ipc.l4_destinations,
+        db,
+    )
+    .map_err(|e| e.into_response_pair(meta.trust_level))?;
+
+    let message_ttl = config.agents_ipc.message_ttl_secs;
+    drop(config);
+
+    let msg_id = db
+        .insert_message(
+            &meta.agent_id,
+            &body.to,
+            &body.kind,
+            &body.payload,
+            meta.trust_level,
+            body.session_id.as_deref(),
+            body.priority,
+            message_ttl,
+        )
+        .map_err(|e| {
+            warn!(error = %e, "IPC insert_message failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to store message",
+                    "code": "db_error"
+                })),
+            )
+        })?;
+
+    info!(
+        from = meta.agent_id,
+        to = body.to,
+        kind = body.kind,
+        msg_id = msg_id,
+        "IPC message sent"
+    );
+
+    Ok(Json(serde_json::json!({ "ok": true, "id": msg_id })))
 }
 
 /// GET /api/ipc/inbox — retrieve messages for the authenticated agent.
 pub async fn handle_ipc_inbox(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<InboxQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
-    Ok(Json(serde_json::json!({ "messages": [] })))
+
+    let messages = db.fetch_inbox(&meta.agent_id, query.quarantine, query.limit);
+
+    Ok(Json(serde_json::json!({ "messages": messages })))
 }
 
 /// GET /api/ipc/state — read a shared state key.
 pub async fn handle_ipc_state_get(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<StateGetQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
-    Ok(Json(serde_json::json!({ "value": null })))
+
+    validate_state_get(meta.trust_level, &query.key)
+        .map_err(|e| e.into_response_pair(meta.trust_level))?;
+
+    let entry = db.get_state(&query.key);
+    Ok(Json(serde_json::json!({ "entry": entry })))
 }
 
 /// POST /api/ipc/state — write a shared state key.
 pub async fn handle_ipc_state_set(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(_body): Json<serde_json::Value>,
+    Json(body): Json<StateSetBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let db = require_ipc_db(&state)?;
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
+
+    validate_state_set(meta.trust_level, &meta.agent_id, &body.key)
+        .map_err(|e| e.into_response_pair(meta.trust_level))?;
+
+    db.set_state(&body.key, &body.value, &meta.agent_id);
+
+    info!(agent = meta.agent_id, key = body.key, "IPC state set");
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-// ── IPC admin endpoint handlers (stubs) ─────────────────────────
+// ── IPC admin endpoint handlers ─────────────────────────────────
 
 /// GET /admin/ipc/agents — full agent list with metadata (localhost only).
 pub async fn handle_admin_ipc_agents(
     State(state): State<AppState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_ipc_db(&state)?;
-    Ok(Json(serde_json::json!({ "agents": [] })))
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+    let staleness = state.config.lock().agents_ipc.staleness_secs;
+    let agents = db.list_agents(staleness);
+    Ok(Json(serde_json::json!({ "agents": agents })))
 }
 
-/// POST /admin/ipc/revoke — revoke an agent's token (localhost only).
+/// POST /admin/ipc/revoke — revoke an agent (block messages, set status=revoked).
 pub async fn handle_admin_ipc_revoke(
     State(state): State<AppState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<AdminAgentBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_ipc_db(&state)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+    db.block_pending_messages(&body.agent_id, "agent_revoked");
+    let found = db.set_agent_status(&body.agent_id, "revoked");
+    if found {
+        info!(agent = body.agent_id, "IPC agent revoked");
+    }
+    Ok(Json(serde_json::json!({ "ok": true, "found": found })))
 }
 
-/// POST /admin/ipc/disable — disable an agent without revoking its token (localhost only).
+/// POST /admin/ipc/disable — disable an agent without revoking its token.
 pub async fn handle_admin_ipc_disable(
     State(state): State<AppState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<AdminAgentBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_ipc_db(&state)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+    db.block_pending_messages(&body.agent_id, "agent_disabled");
+    let found = db.set_agent_status(&body.agent_id, "disabled");
+    if found {
+        info!(agent = body.agent_id, "IPC agent disabled");
+    }
+    Ok(Json(serde_json::json!({ "ok": true, "found": found })))
 }
 
-/// POST /admin/ipc/quarantine — quarantine an agent (localhost only).
+/// POST /admin/ipc/quarantine — quarantine an agent (set trust_level=4).
 pub async fn handle_admin_ipc_quarantine(
     State(state): State<AppState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<AdminAgentBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_ipc_db(&state)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+    let found = db.set_agent_status(&body.agent_id, "quarantined");
+    // Force trust level to 4
+    let _ = db.set_agent_trust_level(&body.agent_id, 4);
+    if found {
+        info!(agent = body.agent_id, "IPC agent quarantined");
+    }
+    Ok(Json(serde_json::json!({ "ok": true, "found": found })))
 }
 
-/// POST /admin/ipc/downgrade — downgrade an agent's trust level (localhost only).
+/// POST /admin/ipc/downgrade — downgrade an agent's trust level (only increases).
 pub async fn handle_admin_ipc_downgrade(
     State(state): State<AppState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<AdminDowngradeBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_ipc_db(&state)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+    match db.set_agent_trust_level(&body.agent_id, body.new_level) {
+        Some(old_level) => {
+            info!(
+                agent = body.agent_id,
+                old_level = old_level,
+                new_level = body.new_level,
+                "IPC agent downgraded"
+            );
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "old_level": old_level,
+                "new_level": body.new_level
+            })))
+        }
+        None => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Agent not found or new_level is not a downgrade",
+                "code": "downgrade_invalid"
+            })),
+        )),
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -831,5 +1265,141 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── Broker handler unit tests (Step 5-7) ────────────────────
+
+    #[test]
+    fn insert_and_fetch_message() {
+        let db = test_db();
+        db.update_last_seen("opus", 1, "coordinator");
+        db.update_last_seen("worker", 3, "agent");
+
+        let id = db
+            .insert_message(
+                "opus",
+                "worker",
+                "task",
+                "do something",
+                1,
+                Some("s1"),
+                0,
+                None,
+            )
+            .unwrap();
+        assert!(id > 0);
+
+        let messages = db.fetch_inbox("worker", true, 50);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from_agent, "opus");
+        assert_eq!(messages[0].kind, "task");
+        assert_eq!(messages[0].payload, "do something");
+
+        // Second fetch should return empty (marked as read)
+        let messages2 = db.fetch_inbox("worker", true, 50);
+        assert!(messages2.is_empty());
+    }
+
+    #[test]
+    fn fetch_inbox_excludes_quarantine() {
+        let db = test_db();
+        db.insert_message("kids", "opus", "text", "hello", 4, None, 0, None)
+            .unwrap();
+        db.insert_message("worker", "opus", "text", "report", 3, None, 0, None)
+            .unwrap();
+
+        // Without quarantine: only L3 message
+        let messages = db.fetch_inbox("opus", false, 50);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from_agent, "worker");
+    }
+
+    #[test]
+    fn fetch_inbox_includes_quarantine() {
+        let db = test_db();
+        db.insert_message("kids", "opus", "text", "hello", 4, None, 0, None)
+            .unwrap();
+        db.insert_message("worker", "opus", "text", "report", 3, None, 0, None)
+            .unwrap();
+
+        let messages = db.fetch_inbox("opus", true, 50);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn list_agents_staleness() {
+        let db = test_db();
+        db.update_last_seen("opus", 1, "coordinator");
+        let agents = db.list_agents(120);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, "online");
+    }
+
+    #[test]
+    fn state_get_set_roundtrip() {
+        let db = test_db();
+        assert!(db.get_state("public:status").is_none());
+
+        db.set_state("public:status", "ready", "worker");
+        let entry = db.get_state("public:status").unwrap();
+        assert_eq!(entry.value, "ready");
+        assert_eq!(entry.owner, "worker");
+
+        // Overwrite
+        db.set_state("public:status", "busy", "opus");
+        let entry = db.get_state("public:status").unwrap();
+        assert_eq!(entry.value, "busy");
+        assert_eq!(entry.owner, "opus");
+    }
+
+    #[test]
+    fn admin_disable_blocks_messages() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        db.insert_message("opus", "worker", "task", "do it", 1, None, 0, None)
+            .unwrap();
+
+        db.block_pending_messages("worker", "agent_disabled");
+        let found = db.set_agent_status("worker", "disabled");
+        assert!(found);
+
+        // Messages should be blocked
+        let messages = db.fetch_inbox("worker", true, 50);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn admin_downgrade_only_increases() {
+        let db = test_db();
+        db.update_last_seen("worker", 2, "agent");
+
+        // Upgrade attempt (2 → 1) should fail
+        assert!(db.set_agent_trust_level("worker", 1).is_none());
+
+        // Same level should fail
+        assert!(db.set_agent_trust_level("worker", 2).is_none());
+
+        // Downgrade (2 → 3) should succeed
+        let old = db.set_agent_trust_level("worker", 3);
+        assert_eq!(old, Some(2));
+    }
+
+    #[test]
+    fn message_ttl_cleanup() {
+        let db = test_db();
+        // Insert a message with expired TTL
+        let conn = db.conn.lock();
+        conn.execute(
+            "INSERT INTO messages (from_agent, to_agent, kind, payload,
+             from_trust_level, seq, created_at, expires_at)
+             VALUES ('opus', 'worker', 'task', 'old', 1, 1, 100, 101)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Fetch should clean up expired messages
+        let messages = db.fetch_inbox("worker", true, 50);
+        assert!(messages.is_empty());
     }
 }

@@ -1583,7 +1583,9 @@ struct AdminResponse {
 }
 
 /// Reject requests that do not originate from a loopback address.
-fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+pub(crate) fn require_localhost(
+    peer: &SocketAddr,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if peer.ip().is_loopback() {
         Ok(())
     } else {
