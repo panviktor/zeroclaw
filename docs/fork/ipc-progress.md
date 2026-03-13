@@ -1,10 +1,10 @@
 # IPC Implementation Progress
 
-Full plan: `~/logs/ipc-implementation-plan.md`
-Sync strategy: `~/logs/fork-sync-strategy.md`
-Delta registry: `~/logs/fork-delta.md`
-Base branch: `fork/main`
-Working branch: feature branch off `fork/main` (name may change after sync/restart work)
+Full plan: [`ipc-plan.md`](ipc-plan.md)
+Sync strategy: [`sync-strategy.md`](sync-strategy.md)
+Delta registry: [`delta-registry.md`](delta-registry.md)
+Base branch: `main`
+Working branch: feature branch off `main` (e.g. `feat/ipc-*`)
 Execution owner: `Opus`
 
 ## Steps Overview

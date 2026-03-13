@@ -31,7 +31,7 @@ Conclusion: we need not a one-time merge, but a **sustainable process**.
 
 1. **The fork uses merge-based sync, not rebase-based sync.**
 2. **Upstream arrives through a dedicated sync PR, not directly into `main`.**
-3. **`fork/main` is the source of truth for the integration history. We do not rewrite it.**
+3. **`main` is the source of truth for the integration history. We do not rewrite it.**
 4. **Recurring conflicts should be learned through `git rerere`.**
 5. **Without fork invariants CI, a sync cannot be considered safe.**
 6. **We must reduce the size of the fork, not only automate conflicts.**
@@ -184,7 +184,7 @@ A clean merge guarantees nothing without these checks.
 Here an “ours-first” mode is usually acceptable because these are our overlay modules:
 - `src/gateway/ipc.rs`
 - `src/tools/agents_ipc.rs`
-- fork-specific docs in `~/logs/`
+- fork-specific docs in `docs/fork/`
 
 ### Shared Hotspots
 
