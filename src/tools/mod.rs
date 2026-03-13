@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod agents_ipc;
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
@@ -59,6 +60,10 @@ pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
 
+pub use agents_ipc::{
+    AgentsInboxTool, AgentsListTool, AgentsReplyTool, AgentsSendTool, AgentsSpawnTool, IpcClient,
+    StateGetTool, StateSetTool,
+};
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
@@ -318,6 +323,29 @@ pub fn all_tools_with_runtime(
                 security.clone(),
             )));
         }
+    }
+
+    // IPC tools (inter-agent communication via broker)
+    if root_config.agents_ipc.enabled {
+        if let Some(ref token) = root_config.agents_ipc.broker_token {
+            let ipc_client = Arc::new(IpcClient::new(
+                &root_config.agents_ipc.broker_url,
+                token,
+                root_config.agents_ipc.request_timeout_secs,
+            ));
+            tool_arcs.push(Arc::new(AgentsListTool::new(ipc_client.clone())));
+            tool_arcs.push(Arc::new(AgentsSendTool::new(ipc_client.clone())));
+            tool_arcs.push(Arc::new(AgentsInboxTool::new(ipc_client.clone())));
+            tool_arcs.push(Arc::new(AgentsReplyTool::new(ipc_client.clone())));
+            tool_arcs.push(Arc::new(StateGetTool::new(ipc_client.clone())));
+            tool_arcs.push(Arc::new(StateSetTool::new(ipc_client)));
+        }
+        // Spawn tool always available when IPC is enabled (local, no broker_token needed)
+        tool_arcs.push(Arc::new(AgentsSpawnTool::new(
+            config.clone(),
+            security.clone(),
+            root_config.agents_ipc.trust_level,
+        )));
     }
 
     // Add delegation tool when agents are configured
