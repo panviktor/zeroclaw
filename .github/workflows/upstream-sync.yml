@@ -41,6 +41,12 @@ jobs:
         if: always() && hashFiles('.sync-meta') != ''
         run: cat .sync-meta >> "$GITHUB_ENV"
 
+      - name: Fail on sync script error without metadata
+        if: always() && steps.sync.outcome == 'failure' && hashFiles('.sync-meta') == ''
+        run: |
+          echo "::error::Sync script failed before writing metadata. Check script logs above."
+          exit 1
+
       - name: Upload conflict report
         if: always() && env.MERGE_STATUS == 'conflict'
         uses: actions/upload-artifact@v4

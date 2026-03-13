@@ -14,9 +14,9 @@ fi
 source "$META_PATH"
 
 sed \
-  -e "s/{{SYNC_BRANCH}}/${SYNC_BRANCH}/g" \
-  -e "s/{{UPSTREAM_SHA}}/${UPSTREAM_SHA}/g" \
-  -e "s/{{OLD_MAIN_SHA}}/${OLD_MAIN_SHA}/g" \
+  -e "s|{{SYNC_BRANCH}}|${SYNC_BRANCH}|g" \
+  -e "s|{{UPSTREAM_SHA}}|${UPSTREAM_SHA}|g" \
+  -e "s|{{OLD_MAIN_SHA}}|${OLD_MAIN_SHA}|g" \
   "$TEMPLATE_PATH" > "$OUTPUT_PATH"
 
 echo "Rendered PR body to $OUTPUT_PATH"

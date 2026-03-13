@@ -44,6 +44,14 @@ git merge --ff-only "$FORK_REMOTE/$MAIN_BRANCH"
 
 if git show-ref --verify --quiet "refs/heads/$SYNC_BRANCH"; then
   echo "Sync branch already exists: $SYNC_BRANCH" >&2
+  cat > "$SYNC_META_PATH" <<META
+SYNC_BRANCH=$SYNC_BRANCH
+MAIN_BRANCH=$MAIN_BRANCH
+UPSTREAM_SHA=$UPSTREAM_SHA
+OLD_MAIN_SHA=$OLD_MAIN_SHA
+MERGE_STATUS=branch_exists
+REPORT_PATH=$REPORT_PATH
+META
   exit 3
 fi
 
