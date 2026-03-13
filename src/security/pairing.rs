@@ -8,6 +8,7 @@
 // Already-paired tokens are persisted in config so restarts don't require
 // re-pairing.
 
+use crate::config::TokenMetadata;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -47,6 +48,12 @@ pub struct PairingGuard {
     pairing_code: Arc<Mutex<Option<String>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     paired_tokens: Arc<Mutex<HashSet<String>>>,
+    /// IPC metadata for each token hash: agent_id, trust_level, role.
+    /// Tokens without an entry are legacy human tokens (no IPC access).
+    token_metadata: Arc<Mutex<HashMap<String, TokenMetadata>>>,
+    /// Metadata to bind to the next token generated via a pairing code.
+    /// Set by `POST /admin/paircode/new` with optional body, consumed on `try_pair()`.
+    pending_metadata: Arc<Mutex<HashMap<String, TokenMetadata>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
 }
@@ -61,6 +68,19 @@ impl PairingGuard {
     /// - Plaintext (`zc_...`): hashed on load for backward compatibility
     /// - Already hashed (64-char hex): stored as-is
     pub fn new(require_pairing: bool, existing_tokens: &[String]) -> Self {
+        Self::with_metadata(require_pairing, existing_tokens, &HashMap::new())
+    }
+
+    /// Create a new pairing guard with IPC token metadata.
+    ///
+    /// `existing_metadata` maps token hashes to their IPC identity.
+    /// Tokens present in `existing_tokens` but absent from `existing_metadata`
+    /// are treated as legacy human tokens (no IPC access).
+    pub fn with_metadata(
+        require_pairing: bool,
+        existing_tokens: &[String],
+        existing_metadata: &HashMap<String, TokenMetadata>,
+    ) -> Self {
         let tokens: HashSet<String> = existing_tokens
             .iter()
             .map(|t| {
@@ -80,6 +100,8 @@ impl PairingGuard {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
+            token_metadata: Arc::new(Mutex::new(existing_metadata.clone())),
+            pending_metadata: Arc::new(Mutex::new(HashMap::new())),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
         }
     }
@@ -132,8 +154,14 @@ impl PairingGuard {
                         guard.0.remove(&client_id);
                     }
                     let token = generate_token();
+                    let token_hash = hash_token(&token);
                     let mut tokens = self.paired_tokens.lock();
-                    tokens.insert(hash_token(&token));
+                    tokens.insert(token_hash.clone());
+
+                    // Transfer pending metadata (if any) to the new token
+                    if let Some(meta) = self.pending_metadata.lock().remove(expected) {
+                        self.token_metadata.lock().insert(token_hash, meta);
+                    }
 
                     // Consume the pairing code so it cannot be reused
                     *pairing_code = None;
@@ -195,6 +223,24 @@ impl PairingGuard {
             .expect("failed to spawn blocking task this should not happen")
     }
 
+    /// Authenticate a bearer token and return its IPC metadata (if any).
+    ///
+    /// Returns `Some(TokenMetadata)` for IPC-eligible tokens, `None` if the
+    /// token is invalid. Legacy tokens (valid but no metadata) return `None`
+    /// — use `is_authenticated()` for simple yes/no checks.
+    pub fn authenticate(&self, token: &str) -> Option<TokenMetadata> {
+        if !self.require_pairing {
+            return None;
+        }
+        let hashed = hash_token(token);
+        let tokens = self.paired_tokens.lock();
+        if !tokens.contains(&hashed) {
+            return None;
+        }
+        let meta = self.token_metadata.lock();
+        meta.get(&hashed).cloned()
+    }
+
     /// Check if a bearer token is valid (compares against stored hashes).
     pub fn is_authenticated(&self, token: &str) -> bool {
         if !self.require_pairing {
@@ -215,6 +261,21 @@ impl PairingGuard {
     pub fn tokens(&self) -> Vec<String> {
         let tokens = self.paired_tokens.lock();
         tokens.iter().cloned().collect()
+    }
+
+    /// Get all token metadata (for persisting to config).
+    pub fn token_metadata(&self) -> HashMap<String, TokenMetadata> {
+        self.token_metadata.lock().clone()
+    }
+
+    /// Set metadata to be bound to the next token generated from the given pairing code.
+    ///
+    /// Called by `POST /admin/paircode/new` when the admin provides agent identity.
+    /// The metadata is consumed on the next successful `try_pair()` for that code.
+    pub fn set_pending_metadata(&self, code: &str, metadata: TokenMetadata) {
+        self.pending_metadata
+            .lock()
+            .insert(code.to_string(), metadata);
     }
 
     /// Generate a new pairing code, even if already paired.
@@ -711,6 +772,97 @@ mod tests {
             state.0.contains_key("fresh_client"),
             "Fresh client should still be tracked"
         );
+    }
+
+    // ── IPC metadata ──────────────────────────────────────────
+
+    #[test]
+    async fn authenticate_returns_metadata_for_ipc_token() {
+        let token_hash = hash_token("zc_agent_token");
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            token_hash,
+            crate::config::TokenMetadata {
+                agent_id: "sentinel".into(),
+                trust_level: 2,
+                role: "monitor".into(),
+            },
+        );
+        let guard = PairingGuard::with_metadata(true, &["zc_agent_token".into()], &metadata);
+        let meta = guard.authenticate("zc_agent_token");
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.agent_id, "sentinel");
+        assert_eq!(meta.trust_level, 2);
+        assert_eq!(meta.role, "monitor");
+    }
+
+    #[test]
+    async fn authenticate_returns_none_for_legacy_token() {
+        let guard = PairingGuard::new(true, &["zc_legacy".into()]);
+        assert!(guard.is_authenticated("zc_legacy"));
+        assert!(guard.authenticate("zc_legacy").is_none());
+    }
+
+    #[test]
+    async fn authenticate_returns_none_for_invalid_token() {
+        let guard = PairingGuard::new(true, &["zc_valid".into()]);
+        assert!(guard.authenticate("zc_invalid").is_none());
+    }
+
+    #[test]
+    async fn authenticate_returns_none_when_pairing_disabled() {
+        let guard = PairingGuard::new(false, &[]);
+        assert!(guard.authenticate("anything").is_none());
+    }
+
+    #[test]
+    async fn pair_with_pending_metadata_binds_to_token() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+
+        guard.set_pending_metadata(
+            &code,
+            crate::config::TokenMetadata {
+                agent_id: "opus".into(),
+                trust_level: 1,
+                role: "coordinator".into(),
+            },
+        );
+
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        let meta = guard.authenticate(&token);
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.agent_id, "opus");
+        assert_eq!(meta.trust_level, 1);
+    }
+
+    #[test]
+    async fn pair_without_pending_metadata_creates_legacy_token() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        assert!(guard.authenticate(&token).is_none());
+        assert!(guard.is_authenticated(&token));
+    }
+
+    #[test]
+    async fn token_metadata_returns_all_metadata() {
+        let token_hash = hash_token("zc_test");
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            token_hash.clone(),
+            crate::config::TokenMetadata {
+                agent_id: "test".into(),
+                trust_level: 3,
+                role: "worker".into(),
+            },
+        );
+        let guard = PairingGuard::with_metadata(true, &["zc_test".into()], &metadata);
+        let all_meta = guard.token_metadata();
+        assert_eq!(all_meta.len(), 1);
+        assert!(all_meta.contains_key(&token_hash));
     }
 
     #[test]
