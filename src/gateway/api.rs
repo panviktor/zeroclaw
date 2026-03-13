@@ -15,7 +15,7 @@ const MASKED_SECRET: &str = "***MASKED***";
 // ── Bearer token auth extractor ─────────────────────────────────
 
 /// Extract and validate bearer token from Authorization header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -748,6 +748,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     for agent in masked.agents.values_mut() {
         mask_optional_secret(&mut agent.api_key);
     }
+    mask_optional_secret(&mut masked.agents_ipc.broker_token);
     for route in &mut masked.model_routes {
         mask_optional_secret(&mut route.api_key);
     }
@@ -839,6 +840,10 @@ fn restore_masked_sensitive_fields(
         &current.reliability.api_keys,
     );
     restore_optional_secret(&mut incoming.composio.api_key, &current.composio.api_key);
+    restore_optional_secret(
+        &mut incoming.agents_ipc.broker_token,
+        &current.agents_ipc.broker_token,
+    );
     restore_optional_secret(
         &mut incoming.browser.computer_use.api_key,
         &current.browser.computer_use.api_key,

@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod ipc;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -312,6 +313,8 @@ pub struct AppState {
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// IPC broker database (None when agents_ipc.enabled = false)
+    pub ipc_db: Option<Arc<ipc::IpcDb>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -652,6 +655,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         cost_tracker,
         event_tx,
         shutdown_tx,
+        ipc_db: None, // Initialized in Step 4 when agents_ipc.enabled = true
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -676,6 +680,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        // ── IPC routes (broker-mediated inter-agent communication) ──
+        .route("/api/ipc/agents", get(ipc::handle_ipc_agents))
+        .route("/api/ipc/send", post(ipc::handle_ipc_send))
+        .route("/api/ipc/inbox", get(ipc::handle_ipc_inbox))
+        .route("/api/ipc/state", get(ipc::handle_ipc_state_get))
+        .route("/api/ipc/state", post(ipc::handle_ipc_state_set))
+        // ── IPC admin routes (localhost only) ──
+        .route("/admin/ipc/agents", get(ipc::handle_admin_ipc_agents))
+        .route("/admin/ipc/revoke", post(ipc::handle_admin_ipc_revoke))
+        .route("/admin/ipc/disable", post(ipc::handle_admin_ipc_disable))
+        .route(
+            "/admin/ipc/quarantine",
+            post(ipc::handle_admin_ipc_quarantine),
+        )
+        .route(
+            "/admin/ipc/downgrade",
+            post(ipc::handle_admin_ipc_downgrade),
+        )
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
@@ -1760,6 +1782,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1810,6 +1833,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2185,6 +2209,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2250,6 +2275,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let headers = HeaderMap::new();
@@ -2327,6 +2353,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let response = handle_webhook(
@@ -2376,6 +2403,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2430,6 +2458,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2489,6 +2518,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2544,6 +2574,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            ipc_db: None,
         };
 
         let mut headers = HeaderMap::new();
