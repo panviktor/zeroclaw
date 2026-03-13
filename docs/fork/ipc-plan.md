@@ -211,7 +211,7 @@ The IPC DB belongs to the broker (gateway process), not to any specific agent.
 
 # Phase 1: Core IPC (this PR)
 
-**Branch**: `feat/cherry-pick-agents-ipc`
+**Branches**: stacked PRs from `feat/ipc-*` branches, merged into `main`
 **Risk**: Medium — behind a feature flag. `enabled: false` by default.
 
 ## New files

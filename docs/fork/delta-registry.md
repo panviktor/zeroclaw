@@ -9,9 +9,9 @@ It serves three purposes:
 - separate fork-only policy from code that can eventually be extracted upstream
 
 Related documents:
-- `ipc-implementation-plan.md`
-- `ipc-progress.md`
-- `fork-sync-strategy.md`
+- [`ipc-plan.md`](ipc-plan.md) — full implementation plan
+- [`ipc-progress.md`](ipc-progress.md) — step-by-step execution tracker
+- [`sync-strategy.md`](sync-strategy.md) — fork sync strategy
 
 ## Statuses
 

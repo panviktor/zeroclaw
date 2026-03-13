@@ -8,10 +8,9 @@ It helps make a quick decision: `Approve`, `Request changes`, or `Escalate`.
 The main goal is to verify not only that the merge builds technically, but also that the **trust, approval, and execution semantics boundaries of the fork have not drifted**.
 
 Related documents:
-- `fork-sync-strategy.md`
-- `fork-sync-automation.md`
-- `fork-delta.md`
-- `ipc-implementation-plan.md`
+- [`sync-strategy.md`](sync-strategy.md) — fork sync strategy
+- [`delta-registry.md`](delta-registry.md) — fork delta registry
+- [`ipc-plan.md`](ipc-plan.md) — IPC implementation plan
 
 ## 1. Approve
 
@@ -27,7 +26,7 @@ Mark `Approve` if all of the following are true at the same time:
   - approval routing
   - quarantine semantics
   - channel behavior
-- `fork-delta.md` does not need an update
+- `delta-registry.md` does not need an update
 - the diff does not change the fork boundary
 
 **Meaning**: upstream arrived safely and fork semantics were preserved.
@@ -40,7 +39,7 @@ Mark `Request changes` if any of the following applies:
 - a `shared-hotspot` was touched, but the review notes are empty
 - CI is green, but fork invariants were not run
 - config / gateway / tools hooks changed, and it is unclear whether IPC was broken
-- a new fork-only piece appeared, but it was not recorded in `fork-delta.md`
+- a new fork-only piece appeared, but it was not recorded in `delta-registry.md`
 - the PR is too large and does not highlight the risky areas
 
 **Meaning**: the merge may be technically possible, but it is not yet proven architecturally.
@@ -61,7 +60,7 @@ Treat the PR as an escalation case if it touches any of the following:
 Escalation is also required if:
 
 - upstream changed the core assumptions the fork depends on
-- the merge requires rethinking part of `fork-delta.md`
+- the merge requires rethinking part of `delta-registry.md`
 - there is a risk that a fork invariant still passes formally, but its meaning has changed
 
 **Meaning**: this is no longer just review; it is an architectural decision.
@@ -98,7 +97,7 @@ If the answer to even one question is “not sure”:
 - [ ] upstream range is clear
 - [ ] hotspot paths were reviewed
 - [ ] fork invariants were run and are green
-- [ ] `fork-delta.md` was updated if the fork boundary changed
+- [ ] `delta-registry.md` was updated if the fork boundary changed
 - [ ] approval / quarantine / trust semantics were not weakened
 - [ ] there is no hidden bypass through channels, scheduler, or tool routing
 

@@ -5,11 +5,10 @@
 This document describes the **operational strategy for maintaining a long-lived fork**, not the workflow of a single feature branch.
 
 Related documents:
-- `ipc-implementation-plan.md` — what exactly we are building
-- `ipc-progress.md` — step-by-step execution of the IPC work
-- `fork-sync-strategy.md` — how not to drown in upstream sync
-- `fork-sync-automation.md` — concrete templates for scripts, workflows, and PR/issue templates
-- `sync-pr-review-rubric.md` — review rules for `sync/upstream-*` PRs
+- [`ipc-plan.md`](ipc-plan.md) — what exactly we are building
+- [`ipc-progress.md`](ipc-progress.md) — step-by-step execution of the IPC work
+- [`sync-review-rubric.md`](sync-review-rubric.md) — review rules for `sync/upstream-*` PRs
+- [`delta-registry.md`](delta-registry.md) — fork delta registry
 
 **Sync process executor**: Opus  
 **Architecture owner**: fork team / Administrator
@@ -212,7 +211,7 @@ All other paths that the fork does not touch. The default strategy there is to a
 
 ## Delta Registry
 
-A separate artifact already exists: `fork-delta.md`. It lists **all intentional delta** of the fork. Minimal format:
+A separate artifact already exists: [`delta-registry.md`](delta-registry.md). It lists **all intentional delta** of the fork. Minimal format:
 - change
 - why it exists
 - fork-only or candidate for upstream

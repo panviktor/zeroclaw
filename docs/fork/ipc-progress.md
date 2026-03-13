@@ -14,17 +14,17 @@ Execution owner: `Opus`
 | 1 | Config: AgentsIpcConfig + schema | config/schema.rs, config/mod.rs | DONE (2026-03-13) | — |
 | 2 | Pairing: TokenMetadata + authenticate() | security/pairing.rs | DONE (2026-03-13) | 1 |
 | 3 | Gateway plumbing: AppState + routes + IpcDb init | gateway/mod.rs, gateway/api.rs, gateway/ipc.rs | DONE (2026-03-13) | 1, 2 |
-| 4 | Broker core: IpcDb + schema + ACL | gateway/ipc.rs (new) | TODO | 3 |
-| 5 | Broker handlers: send, inbox, agents_list | gateway/ipc.rs | TODO | 4 |
-| 6 | Broker handlers: state_get, state_set | gateway/ipc.rs | TODO | 4 |
-| 7 | Admin endpoints: revoke, disable, quarantine, downgrade | gateway/ipc.rs | TODO | 4 |
-| 8 | Tools: IpcClient + agents_list, agents_send, agents_inbox | tools/agents_ipc.rs (new) | TODO | 5 |
-| 9 | Tools: agents_reply, state_get, state_set | tools/agents_ipc.rs | TODO | 6, 8 |
-| 10 | Tools: agents_spawn | tools/agents_ipc.rs | TODO | 1 |
-| 11 | Tool registration + wizard | tools/mod.rs, onboard/wizard.rs | TODO | 8, 9, 10 |
-| 12 | Tests: ACL unit tests | gateway/ipc.rs #[cfg(test)] | TODO | 4 |
-| 13 | Tests: broker handler tests | gateway/ipc.rs #[cfg(test)] | TODO | 5, 6 |
-| 14 | Tests: tool HTTP client tests | tools/agents_ipc.rs #[cfg(test)] | TODO | 8, 9 |
+| 4 | Broker core: IpcDb + schema + ACL | gateway/ipc.rs (new) | DONE (2026-03-13) | 3 |
+| 5 | Broker handlers: send, inbox, agents_list | gateway/ipc.rs | DONE (2026-03-13) | 4 |
+| 6 | Broker handlers: state_get, state_set | gateway/ipc.rs | DONE (2026-03-13) | 4 |
+| 7 | Admin endpoints: revoke, disable, quarantine, downgrade | gateway/ipc.rs | DONE (2026-03-13) | 4 |
+| 8 | Tools: IpcClient + agents_list, agents_send, agents_inbox | tools/agents_ipc.rs (new) | DONE (2026-03-13) | 5 |
+| 9 | Tools: agents_reply, state_get, state_set | tools/agents_ipc.rs | DONE (2026-03-13) | 6, 8 |
+| 10 | Tools: agents_spawn | tools/agents_ipc.rs | DONE (2026-03-13) | 1 |
+| 11 | Tool registration + wizard | tools/mod.rs, onboard/wizard.rs | DONE (2026-03-13) | 8, 9, 10 |
+| 12 | Tests: ACL unit tests | gateway/ipc.rs #[cfg(test)] | DONE (2026-03-13) | 4 |
+| 13 | Tests: broker handler tests | gateway/ipc.rs #[cfg(test)] | DONE (2026-03-13) | 5, 6 |
+| 14 | Tests: tool HTTP client tests | tools/agents_ipc.rs #[cfg(test)] | DONE (2026-03-13) | 8, 9 |
 | 15 | Integration: cargo fmt + clippy + test | — | TODO | all |
 
 ## Step Details
@@ -95,7 +95,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo check`
 
-**Notes**: This is the largest step (~300 lines). Can split if needed.
+**Notes**: ~300 lines. PR #10 on `feat/ipc-broker-core`. 25 unit tests.
 
 ---
 
@@ -108,7 +108,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo check`
 
-**Notes**: —
+**Notes**: Steps 5-7 implemented together. PR #12 on `feat/ipc-broker-handlers`. 40 tests total. Critical fix PR #13 followed: admin kill-switch effectiveness, query→result correlation, L4 topology masking, quarantine isolation.
 
 ---
 
@@ -135,7 +135,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo check`
 
-**Notes**: —
+**Notes**: See Step 5 notes.
 
 ---
 
@@ -150,7 +150,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo check`
 
-**Notes**: —
+**Notes**: Steps 8-10 implemented together. PR #15 on `feat/ipc-tools`. 10 tool tests.
 
 ---
 
@@ -163,7 +163,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo check`
 
-**Notes**: —
+**Notes**: See Step 8 notes.
 
 ---
 
@@ -173,11 +173,11 @@ Execution owner: `Opus`
 - `AgentsSpawnTool`: local (no IpcClient), uses `cron::add_agent_job()`
 - Parameters: prompt, model, session_id, wait_for_result, timeout_secs
 - Trust propagation: `child_level = max(requested, parent_level)` (convention-based Phase 1)
-- security.can_act() + record_action()
+- security.can_act() check
 
 **Verify**: `cargo check`
 
-**Notes**: —
+**Notes**: See Step 8 notes. Uses `cron::Schedule::At` for one-shot immediate execution with `delete_after_run=true`.
 
 ---
 
@@ -189,7 +189,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo check`, `cargo test` (enabled=false → no tools registered → no impact)
 
-**Notes**: —
+**Notes**: Done as part of Steps 1 (wizard) and 8 (mod.rs registration). 7 tools registered conditionally.
 
 ---
 
@@ -203,7 +203,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo test -- ipc`
 
-**Notes**: —
+**Notes**: Integrated into Steps 4 and fix PR #13. 50 tests in gateway/ipc.rs covering all ACL rules, state validation, admin operations.
 
 ---
 
@@ -218,7 +218,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo test -- ipc`
 
-**Notes**: —
+**Notes**: Integrated into Steps 5-7. Tests: insert/fetch roundtrip, quarantine isolation, TTL cleanup, admin disable/downgrade.
 
 ---
 
@@ -232,7 +232,7 @@ Execution owner: `Opus`
 
 **Verify**: `cargo test -- agents_ipc`
 
-**Notes**: —
+**Notes**: Integrated into Steps 8-10. Tests: client URL handling, all 7 tool specs, payload truncation.
 
 ---
 
@@ -245,7 +245,7 @@ Execution owner: `Opus`
 - `enabled: false` by default — all existing tests pass
 - latest sync with `vendor/upstream-master` is merged or current sync PR is green
 - fork invariants pass after latest upstream sync (ACL, quarantine, approval routing, revoke/disable)
-- if touched file set expanded: update `fork-sync-strategy.md` hotspot list / delta registry
+- if touched file set expanded: update `sync-strategy.md` hotspot list / `delta-registry.md`
 - Manual test flow (if time permits)
 
 **Verify**: CI-equivalent
@@ -258,4 +258,9 @@ Execution owner: `Opus`
 
 | Date | Session | Steps done | Notes |
 |------|---------|------------|-------|
-| — | — | — | — |
+| 2026-03-13 | 1 | 1, 2, 3 | Config, pairing, gateway plumbing. PRs #5, #6, #7 |
+| 2026-03-13 | 2 | 4 | Broker core: IpcDb, ACL, 25 tests. PR #10 |
+| 2026-03-13 | 3 | 5, 6, 7 | All handlers + admin endpoints + 40 tests. PR #12 |
+| 2026-03-13 | 3 | fix | Critical fixes: kill-switch, query→result, L4 masking, quarantine. PR #13 |
+| 2026-03-13 | 3 | fix | Sync script fixes (sed delimiter, workflow failures). PR #14 |
+| 2026-03-13 | 3 | 8, 9, 10 | All 7 IPC tools + registration. PR #15 |
