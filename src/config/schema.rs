@@ -90,6 +90,13 @@ pub struct Config {
     )]
     pub default_temperature: f64,
 
+    /// HTTP request timeout in seconds for LLM provider API calls. Default: `120`.
+    ///
+    /// Increase for slower backends (e.g., llama.cpp on constrained hardware)
+    /// that need more time processing large contexts.
+    #[serde(default = "default_provider_timeout_secs")]
+    pub provider_timeout_secs: u64,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -293,6 +300,13 @@ const DEFAULT_TEMPERATURE: f64 = 0.7;
 
 fn default_temperature() -> f64 {
     DEFAULT_TEMPERATURE
+}
+
+/// Default provider HTTP request timeout: 120 seconds.
+const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 120;
+
+fn default_provider_timeout_secs() -> u64 {
+    DEFAULT_PROVIDER_TIMEOUT_SECS
 }
 
 /// Validate that a temperature value is within the allowed range.
@@ -604,6 +618,9 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
+    #[serde(default)]
+    pub tool_call_dedup_exempt: Vec<String>,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -626,6 +643,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            tool_call_dedup_exempt: Vec::new(),
         }
     }
 }
@@ -3129,8 +3147,11 @@ pub struct MatrixConfig {
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
     /// Matrix access token for the bot account.
-    pub access_token: String,
+    /// Optional when `password` is set (bot will login and obtain a token automatically).
+    #[serde(default)]
+    pub access_token: Option<String>,
     /// Optional Matrix user ID (e.g. `"@bot:matrix.org"`).
+    /// Required when using password-based login without access_token.
     #[serde(default)]
     pub user_id: Option<String>,
     /// Optional Matrix device ID.
@@ -3140,6 +3161,15 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// Optional Matrix account password. When set, the bot will:
+    /// - Login automatically if no access_token is configured (simplest setup).
+    /// - Bootstrap cross-signing so the device is marked as "verified by its owner".
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Maximum media download size in megabytes. Set to 0 for no limit.
+    /// Defaults to 50 MB when omitted.
+    #[serde(default)]
+    pub max_media_download_mb: Option<u32>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -3832,6 +3862,7 @@ impl Default for Config {
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
             default_temperature: default_temperature(),
+            provider_timeout_secs: default_provider_timeout_secs(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -4349,6 +4380,19 @@ impl Config {
                 decrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
             }
 
+            if let Some(ref mut matrix) = config.channels_config.matrix {
+                decrypt_optional_secret(
+                    &store,
+                    &mut matrix.access_token,
+                    "config.channels_config.matrix.access_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut matrix.password,
+                    "config.channels_config.matrix.password",
+                )?;
+            }
+
             #[cfg(feature = "channel-nostr")]
             if let Some(ref mut ns) = config.channels_config.nostr {
                 decrypt_secret(
@@ -4390,13 +4434,6 @@ impl Config {
                     &store,
                     &mut mm.bot_token,
                     "config.channels_config.mattermost.bot_token",
-                )?;
-            }
-            if let Some(ref mut mx) = config.channels_config.matrix {
-                decrypt_secret(
-                    &store,
-                    &mut mx.access_token,
-                    "config.channels_config.matrix.access_token",
                 )?;
             }
             if let Some(ref mut wa) = config.channels_config.whatsapp {
@@ -4825,6 +4862,28 @@ impl Config {
             }
         }
 
+        // Matrix: password-only login requires user_id
+        if let Some(ref matrix) = self.channels_config.matrix {
+            let has_access_token = matrix
+                .access_token
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_password = matrix
+                .password
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_user_id = matrix
+                .user_id
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+
+            if has_password && !has_access_token && !has_user_id {
+                anyhow::bail!(
+                    "channels_config.matrix.user_id is required when password is set and access_token is omitted"
+                );
+            }
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -4885,6 +4944,15 @@ impl Config {
         if let Ok(model) = std::env::var("ZEROCLAW_MODEL").or_else(|_| std::env::var("MODEL")) {
             if !model.is_empty() {
                 self.default_model = Some(model);
+            }
+        }
+
+        // Provider HTTP timeout: ZEROCLAW_PROVIDER_TIMEOUT_SECS
+        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_PROVIDER_TIMEOUT_SECS") {
+            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
+                if timeout_secs > 0 {
+                    self.provider_timeout_secs = timeout_secs;
+                }
             }
         }
 
@@ -5186,6 +5254,19 @@ impl Config {
             encrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
         }
 
+        if let Some(ref mut matrix) = config_to_save.channels_config.matrix {
+            encrypt_optional_secret(
+                &store,
+                &mut matrix.access_token,
+                "config.channels_config.matrix.access_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut matrix.password,
+                "config.channels_config.matrix.password",
+            )?;
+        }
+
         #[cfg(feature = "channel-nostr")]
         if let Some(ref mut ns) = config_to_save.channels_config.nostr {
             encrypt_secret(
@@ -5227,13 +5308,6 @@ impl Config {
                 &store,
                 &mut mm.bot_token,
                 "config.channels_config.mattermost.bot_token",
-            )?;
-        }
-        if let Some(ref mut mx) = config_to_save.channels_config.matrix {
-            encrypt_secret(
-                &store,
-                &mut mx.access_token,
-                "config.channels_config.matrix.access_token",
             )?;
         }
         if let Some(ref mut wa) = config_to_save.channels_config.whatsapp {
@@ -5525,6 +5599,7 @@ mod tests {
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
+        assert_eq!(c.provider_timeout_secs, 120);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
@@ -5729,6 +5804,7 @@ default_temperature = 0.7
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.5,
+            provider_timeout_secs: 120,
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -5869,6 +5945,18 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+        // provider_timeout_secs defaults to 120 when not specified
+        assert_eq!(parsed.provider_timeout_secs, 120);
+    }
+
+    #[test]
+    async fn provider_timeout_secs_parses_from_toml() {
+        let raw = r#"
+default_temperature = 0.7
+provider_timeout_secs = 300
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.provider_timeout_secs, 300);
     }
 
     #[test]
@@ -5969,6 +6057,7 @@ tool_dispatcher = "xml"
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.9,
+            provider_timeout_secs: 120,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -6235,16 +6324,18 @@ tool_dispatcher = "xml"
     async fn matrix_config_serde() {
         let mc = MatrixConfig {
             homeserver: "https://matrix.org".into(),
-            access_token: "syt_token_abc".into(),
+            access_token: Some("syt_token_abc".to_string()),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
+            password: None,
+            max_media_download_mb: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.homeserver, "https://matrix.org");
-        assert_eq!(parsed.access_token, "syt_token_abc");
+        assert_eq!(parsed.access_token.as_deref(), Some("syt_token_abc"));
         assert_eq!(parsed.user_id.as_deref(), Some("@bot:matrix.org"));
         assert_eq!(parsed.device_id.as_deref(), Some("DEVICE123"));
         assert_eq!(parsed.room_id, "!room123:matrix.org");
@@ -6255,11 +6346,13 @@ tool_dispatcher = "xml"
     async fn matrix_config_toml_roundtrip() {
         let mc = MatrixConfig {
             homeserver: "https://synapse.local:8448".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".to_string()),
             user_id: None,
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
+            password: None,
+            max_media_download_mb: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -6344,11 +6437,13 @@ allowed_users = ["@ops:matrix.org"]
             }),
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
-                access_token: "tok".into(),
+                access_token: Some("tok".to_string()),
                 user_id: None,
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
+                password: None,
+                max_media_download_mb: None,
             }),
             signal: None,
             whatsapp: None,
@@ -8379,5 +8474,74 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn validate_matrix_password_requires_user_id() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            channels_config: ChannelsConfig {
+                matrix: Some(MatrixConfig {
+                    homeserver: "https://matrix.org".into(),
+                    access_token: None,
+                    user_id: None,
+                    device_id: None,
+                    room_id: "!room:matrix.org".into(),
+                    allowed_users: vec!["@u:m".into()],
+                    password: Some("secret".into()),
+                    max_media_download_mb: None,
+                }),
+                ..ChannelsConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = config.validate().expect_err("expected validation to fail");
+        assert!(err
+            .to_string()
+            .contains("user_id is required when password is set"));
+    }
+
+    #[test]
+    async fn validate_matrix_password_with_user_id_ok() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            channels_config: ChannelsConfig {
+                matrix: Some(MatrixConfig {
+                    homeserver: "https://matrix.org".into(),
+                    access_token: None,
+                    user_id: Some("@bot:matrix.org".into()),
+                    device_id: None,
+                    room_id: "!room:matrix.org".into(),
+                    allowed_users: vec!["@u:m".into()],
+                    password: Some("secret".into()),
+                    max_media_download_mb: None,
+                }),
+                ..ChannelsConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_matrix_access_token_only_ok() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            channels_config: ChannelsConfig {
+                matrix: Some(MatrixConfig {
+                    homeserver: "https://matrix.org".into(),
+                    access_token: Some("syt_tok".into()),
+                    user_id: None,
+                    device_id: None,
+                    room_id: "!room:matrix.org".into(),
+                    allowed_users: vec!["@u:m".into()],
+                    password: None,
+                    max_media_download_mb: None,
+                }),
+                ..ChannelsConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }
