@@ -5703,6 +5703,38 @@ impl Config {
             self.proxy.services = normalize_service_list(vec![services_raw]);
         }
 
+        // ── Phase 3A: Ephemeral agent IPC bootstrap ────────────────
+        // When launched as a subprocess by agents_spawn, the parent sets
+        // ZEROCLAW_BROKER_TOKEN + ZEROCLAW_AGENT_ID + ZEROCLAW_SESSION_ID.
+        // We override agents_ipc config so the child can use IPC tools
+        // (agents_reply, state_set, etc.) without manual config.
+        if let Ok(broker_token) = std::env::var("ZEROCLAW_BROKER_TOKEN") {
+            if !broker_token.is_empty() {
+                self.agents_ipc.enabled = true;
+                self.agents_ipc.broker_token = Some(broker_token);
+
+                if let Ok(broker_url) = std::env::var("ZEROCLAW_BROKER_URL") {
+                    if !broker_url.is_empty() {
+                        self.agents_ipc.broker_url = broker_url;
+                    }
+                }
+
+                if let Ok(agent_id) = std::env::var("ZEROCLAW_AGENT_ID") {
+                    if !agent_id.is_empty() {
+                        // Use agent_id from env to determine trust level identity
+                        // (the broker already knows the real trust level from
+                        // the token metadata — this is just for local reference).
+                        tracing::info!(
+                            agent_id = agent_id,
+                            "IPC bootstrap: ephemeral agent identity from env"
+                        );
+                    }
+                }
+
+                tracing::info!("IPC bootstrap: enabled via ZEROCLAW_BROKER_TOKEN env var");
+            }
+        }
+
         if let Err(error) = self.proxy.validate() {
             tracing::warn!("Invalid proxy configuration ignored: {error}");
             self.proxy.enabled = false;

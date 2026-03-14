@@ -33,6 +33,7 @@ impl SystemPromptBuilder {
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
+                Box::new(EphemeralAgentSection),
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
@@ -63,6 +64,7 @@ impl SystemPromptBuilder {
     }
 }
 
+pub struct EphemeralAgentSection;
 pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
@@ -70,6 +72,38 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+
+/// Injects ephemeral agent context when this process was spawned by a parent
+/// agent via `agents_spawn`. Detected by the presence of `ZEROCLAW_SESSION_ID`
+/// env var (set by the parent's subprocess launcher).
+impl PromptSection for EphemeralAgentSection {
+    fn name(&self) -> &str {
+        "ephemeral_agent"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        let session_id = match std::env::var("ZEROCLAW_SESSION_ID") {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Ok(String::new()),
+        };
+        let agent_id = std::env::var("ZEROCLAW_AGENT_ID").unwrap_or_default();
+
+        let mut prompt = String::from("## Ephemeral Agent Context\n\n");
+        write!(
+            prompt,
+            "You are an ephemeral agent (id: {agent_id}) spawned to handle a specific task.\n\
+             Session: {session_id}\n\n\
+             When you have completed your task, use the `agents_reply` tool to send your \
+             result back to the parent agent. Include the session_id in your reply.\n\n\
+             Important:\n\
+             - You are a disposable worker — focus on the task, produce a result, then reply.\n\
+             - Use `agents_reply` with `to` set to the parent and `session_id` = \"{session_id}\".\n\
+             - Your identity and token will be revoked after you reply or timeout.\n"
+        )?;
+
+        Ok(prompt)
+    }
+}
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
