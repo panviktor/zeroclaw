@@ -316,6 +316,8 @@ pub struct AppState {
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Audit logger for persistent security event logging
     pub audit_logger: Option<Arc<crate::security::AuditLogger>>,
+    /// PromptGuard for IPC payload injection scanning
+    pub ipc_prompt_guard: Option<crate::security::PromptGuard>,
     /// IPC broker database (None when agents_ipc.enabled = false)
     pub ipc_db: Option<Arc<ipc::IpcDb>>,
     /// IPC per-agent send rate limiter (None when IPC is disabled)
@@ -664,6 +666,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
+    // PromptGuard for IPC payload scanning
+    let ipc_prompt_guard = if config.agents_ipc.enabled && config.agents_ipc.prompt_guard.enabled {
+        let action =
+            crate::security::GuardAction::from_str(&config.agents_ipc.prompt_guard.action);
+        Some(crate::security::PromptGuard::with_config(
+            action,
+            config.agents_ipc.prompt_guard.sensitivity,
+        ))
+    } else {
+        None
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -689,6 +703,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         event_tx,
         shutdown_tx,
         audit_logger,
+        ipc_prompt_guard,
         ipc_db: None, // Initialized later when agents_ipc.enabled = true
         ipc_rate_limiter: if config.agents_ipc.enabled {
             Some(Arc::new(SlidingWindowRateLimiter::new(
@@ -1855,6 +1870,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -1911,6 +1927,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2291,6 +2308,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2361,6 +2379,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2443,6 +2462,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2497,6 +2517,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2556,6 +2577,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2620,6 +2642,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2680,6 +2703,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             audit_logger: None,
+            ipc_prompt_guard: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,

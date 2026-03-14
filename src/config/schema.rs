@@ -1310,6 +1310,42 @@ pub struct AgentsIpcConfig {
     /// Example: `{ "supervisor" = "opus", "escalation" = "sentinel" }`
     #[serde(default)]
     pub l4_destinations: HashMap<String, String>,
+
+    /// PromptGuard configuration for IPC payload scanning.
+    #[serde(default)]
+    pub prompt_guard: IpcPromptGuardConfig,
+}
+
+/// PromptGuard configuration for IPC message payload scanning.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct IpcPromptGuardConfig {
+    /// Enable PromptGuard scanning on IPC messages (default: true when IPC is enabled).
+    pub enabled: bool,
+
+    /// Action when injection detected: "block" or "warn" (default: "block").
+    /// "block" = reject message with 403. "warn" = allow but log suspicion.
+    pub action: String,
+
+    /// Sensitivity threshold 0.0-1.0 (default: 0.55).
+    /// Blocking triggers when max_score > sensitivity (strict greater-than).
+    /// Category scores: command_injection=0.6, tool_injection=0.7-0.8,
+    /// jailbreak=0.85, role_confusion=0.9, secret_extraction=0.95, system_override=1.0.
+    pub sensitivity: f64,
+
+    /// Trust levels exempt from scanning (default: [0, 1]).
+    pub exempt_levels: Vec<u8>,
+}
+
+impl Default for IpcPromptGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            action: "block".into(),
+            sensitivity: 0.55,
+            exempt_levels: vec![0, 1],
+        }
+    }
 }
 
 fn default_broker_url() -> String {
@@ -1354,6 +1390,7 @@ impl Default for AgentsIpcConfig {
             request_timeout_secs: default_ipc_request_timeout_secs(),
             lateral_text_pairs: Vec::new(),
             l4_destinations: HashMap::new(),
+            prompt_guard: IpcPromptGuardConfig::default(),
         }
     }
 }

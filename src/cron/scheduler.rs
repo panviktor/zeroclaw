@@ -107,7 +107,7 @@ async fn process_due_jobs(
                 let security = Arc::clone(security);
                 let component = component.to_owned();
                 async move {
-                    execute_and_persist_job(&config, security.as_ref(), &job, &component).await
+                    Box::pin(execute_and_persist_job(&config, security.as_ref(), &job, &component)).await
                 }
             }),
         )

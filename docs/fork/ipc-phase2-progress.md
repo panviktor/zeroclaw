@@ -10,8 +10,8 @@ Execution owner: `Opus`
 
 | # | Step | Files | Status | Depends on |
 |---|------|-------|--------|------------|
-| 1 | Audit trail: IPC event types + AuditLogger wiring | security/audit.rs, gateway/ipc.rs, gateway/mod.rs | TODO | — |
-| 2 | PromptGuard: broker payload scanning (block/warn only) | gateway/ipc.rs, config/schema.rs, gateway/mod.rs | TODO | 1 |
+| 1 | Audit trail: IPC event types + AuditLogger wiring | security/audit.rs, gateway/ipc.rs, gateway/mod.rs | DONE (2026-03-14) | — |
+| 2 | PromptGuard: broker payload scanning (block/warn only) | gateway/ipc.rs, config/schema.rs, gateway/mod.rs | DONE (2026-03-14) | 1 |
 | 3 | Structured output: trust_warning + quarantine label | gateway/ipc.rs, tools/agents_ipc.rs | TODO | — |
 | 4 | Credential leak scanning via LeakDetector (send + state_set) | gateway/ipc.rs, gateway/mod.rs | TODO | 1 |
 | 5 | Sequence integrity check | gateway/ipc.rs | TODO | — |
@@ -25,3 +25,5 @@ Execution owner: `Opus`
 
 | Date | Session | Steps done | Notes |
 |------|---------|------------|-------|
+| 2026-03-14 | 1 | 1 | Audit trail: 7 event types, AuditEvent::ipc() builder, wired into all handlers. PR #26 |
+| 2026-03-14 | 1 | 2 | PromptGuard: IpcPromptGuardConfig, scan in handle_ipc_send, block/warn, exempt levels. |
