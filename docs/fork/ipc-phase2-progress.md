@@ -11,14 +11,15 @@ Execution owner: `Opus`
 | # | Step | Files | Status | Depends on |
 |---|------|-------|--------|------------|
 | 1 | Audit trail: IPC event types + AuditLogger wiring | security/audit.rs, gateway/ipc.rs, gateway/mod.rs | TODO | — |
-| 2 | PromptGuard: broker payload scanning | gateway/ipc.rs, config/schema.rs, gateway/mod.rs | TODO | 1 |
+| 2 | PromptGuard: broker payload scanning (block/warn only) | gateway/ipc.rs, config/schema.rs, gateway/mod.rs | TODO | 1 |
 | 3 | Structured output: trust_warning + quarantine label | gateway/ipc.rs, tools/agents_ipc.rs | TODO | — |
-| 4 | Credential leak scanning | security/prompt_guard.rs | TODO | 2 |
-| 5 | Replay protection: seq validation on receive | gateway/ipc.rs | TODO | — |
-| 6 | Session length limits + auto-escalation | gateway/ipc.rs, config/schema.rs | TODO | — |
-| 7 | Promote-to-task: quarantine → working context | gateway/ipc.rs, gateway/mod.rs | TODO | 1, 3 |
-| 8 | Synchronous spawn: wait_for_result + timeout | tools/agents_ipc.rs, gateway/ipc.rs | TODO | — |
-| 9 | Final validation: fmt + clippy + test + docs | — | TODO | all |
+| 4 | Credential leak scanning via LeakDetector (send + state_set) | gateway/ipc.rs, gateway/mod.rs | TODO | 1 |
+| 5 | Sequence integrity check | gateway/ipc.rs | TODO | — |
+| 6 | Session length limits + provenance-preserving escalation | gateway/ipc.rs, config/schema.rs | TODO | 1 |
+| 7 | Promote-to-task: quarantine -> provenance-preserving envelope | gateway/ipc.rs, gateway/mod.rs | TODO | 1, 3 |
+| 8 | Final validation: fmt + clippy + test + docs | — | TODO | all |
+
+> **Deferred to Phase 3**: synchronous spawn (`wait_for_result`), PromptGuard sanitize mode, HMAC audit signing, sender-side replay protection. See plan for rationale.
 
 ## Session Log
 
