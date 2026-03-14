@@ -582,15 +582,21 @@ impl Tool for StateSetTool {
 
 // ── AgentsSpawnTool ──────────────────────────────────────────────
 
-/// Tool for spawning a new agent process via the cron scheduler.
+/// Tool for spawning a new agent process.
 ///
-/// This is a local tool — it does not use the IPC HTTP client. Instead it
-/// creates a one-shot cron job that runs immediately. Trust propagation:
-/// child trust_level >= parent trust_level (cannot escalate).
+/// Two modes:
+/// - **Broker-backed** (when `ipc_client` is set): provisions an ephemeral
+///   identity via the broker, launches a subprocess with its own token, and
+///   optionally waits for the result by polling `spawn-status`.
+/// - **Legacy** (no `ipc_client`): creates a fire-and-forget one-shot cron job
+///   that runs in-process. `wait` is ignored in this mode.
+///
+/// Trust propagation: child trust_level >= parent trust_level (cannot escalate).
 pub struct AgentsSpawnTool {
     config: Arc<crate::config::Config>,
     security: Arc<crate::security::SecurityPolicy>,
     parent_trust_level: u8,
+    ipc_client: Option<Arc<IpcClient>>,
 }
 
 impl AgentsSpawnTool {
@@ -603,9 +609,30 @@ impl AgentsSpawnTool {
             config,
             security,
             parent_trust_level,
+            ipc_client: None,
+        }
+    }
+
+    /// Create with an IPC client for broker-backed spawn (Phase 3A).
+    pub fn with_broker(
+        config: Arc<crate::config::Config>,
+        security: Arc<crate::security::SecurityPolicy>,
+        parent_trust_level: u8,
+        ipc_client: Arc<IpcClient>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            parent_trust_level,
+            ipc_client: Some(ipc_client),
         }
     }
 }
+
+/// Exponential backoff parameters for spawn-status polling.
+const POLL_INITIAL_MS: u64 = 100;
+const POLL_MAX_MS: u64 = 5000;
+const POLL_BACKOFF_FACTOR: u64 = 2;
 
 #[async_trait]
 impl Tool for AgentsSpawnTool {
@@ -615,8 +642,8 @@ impl Tool for AgentsSpawnTool {
 
     fn description(&self) -> &str {
         "Spawn a new agent process with a given prompt. The child agent runs as a \
-         one-shot cron job and inherits your trust level or lower. You cannot spawn \
-         agents with higher trust than your own."
+         separate process and inherits your trust level or lower. Use wait=true to \
+         block until the child sends its result."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -638,6 +665,18 @@ impl Tool for AgentsSpawnTool {
                 "trust_level": {
                     "type": "integer",
                     "description": "Trust level for child (0-4). Must be >= parent's level. Default: parent's level."
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "If true, block until the child sends its result or timeout. Default: false."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds for wait mode (10-3600). Default: 300."
+                },
+                "workload": {
+                    "type": "string",
+                    "description": "Workload profile name (optional). Can only narrow the tool set, not widen."
                 }
             },
             "required": ["prompt"]
@@ -662,6 +701,9 @@ impl Tool for AgentsSpawnTool {
         let requested_level = args["trust_level"]
             .as_u64()
             .and_then(|v| u8::try_from(v).ok());
+        let wait = args["wait"].as_bool().unwrap_or(false);
+        let timeout = args["timeout"].as_u64().unwrap_or(300).clamp(10, 3600) as u32;
+        let workload = args["workload"].as_str().map(String::from);
 
         // Trust propagation: child >= parent
         let child_level = requested_level
@@ -682,7 +724,36 @@ impl Tool for AgentsSpawnTool {
             }
         }
 
-        // Create one-shot job that fires ~1 second from now
+        // Broker-backed mode: provision ephemeral identity + subprocess + optional wait
+        if let Some(ref client) = self.ipc_client {
+            return self
+                .spawn_broker_backed(
+                    client,
+                    prompt,
+                    name,
+                    model,
+                    child_level,
+                    wait,
+                    timeout,
+                    workload,
+                )
+                .await;
+        }
+
+        // Legacy mode: fire-and-forget in-process cron job (wait is ignored)
+        self.spawn_legacy(prompt, name, model, child_level)
+    }
+}
+
+impl AgentsSpawnTool {
+    /// Legacy fire-and-forget spawn via in-process cron job.
+    fn spawn_legacy(
+        &self,
+        prompt: &str,
+        name: Option<String>,
+        model: Option<String>,
+        child_level: u8,
+    ) -> anyhow::Result<ToolResult> {
         let run_at = chrono::Utc::now() + chrono::Duration::seconds(1);
         let schedule = crate::cron::Schedule::At { at: run_at };
 
@@ -696,13 +767,14 @@ impl Tool for AgentsSpawnTool {
             &spawn_prompt,
             crate::cron::SessionTarget::Isolated,
             model,
-            None, // delivery
-            true, // delete_after_run
+            None,
+            true,
         ) {
             Ok(job) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(&json!({
                     "spawned": true,
+                    "mode": "legacy",
                     "job_id": job.id,
                     "name": job_name,
                     "trust_level": child_level,
@@ -715,6 +787,198 @@ impl Tool for AgentsSpawnTool {
                 output: String::new(),
                 error: Some(format!("Failed to spawn agent: {e}")),
             }),
+        }
+    }
+
+    /// Broker-backed spawn: provision ephemeral identity → subprocess → optional wait.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_broker_backed(
+        &self,
+        client: &IpcClient,
+        prompt: &str,
+        name: Option<String>,
+        model: Option<String>,
+        child_level: u8,
+        wait: bool,
+        timeout: u32,
+        workload: Option<String>,
+    ) -> anyhow::Result<ToolResult> {
+        // 1. Provision ephemeral identity from broker
+        let provision_body = json!({
+            "trust_level": child_level,
+            "timeout": timeout,
+            "workload": workload,
+        });
+
+        let resp = client
+            .post("/api/ipc/provision-ephemeral", &provision_body)
+            .await
+            .map_err(|e| anyhow::anyhow!("Broker provision request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Broker provision failed ({status}): {body}")),
+            });
+        }
+
+        let provision: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse provision response: {e}"))?;
+
+        let child_agent_id = provision["agent_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing agent_id in provision response"))?;
+        let child_token = provision["token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing token in provision response"))?;
+        let session_id = provision["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing session_id in provision response"))?;
+
+        // 2. Build env overlay for the child subprocess
+        let mut env_overlay = std::collections::HashMap::new();
+        env_overlay.insert(
+            "ZEROCLAW_BROKER_URL".into(),
+            self.config.agents_ipc.broker_url.clone(),
+        );
+        env_overlay.insert("ZEROCLAW_BROKER_TOKEN".into(), child_token.to_string());
+        env_overlay.insert("ZEROCLAW_AGENT_ID".into(), child_agent_id.to_string());
+        env_overlay.insert("ZEROCLAW_SESSION_ID".into(), session_id.to_string());
+        env_overlay.insert("ZEROCLAW_TIMEOUT_SECS".into(), timeout.to_string());
+
+        // 3. Create one-shot subprocess cron job
+        let run_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let schedule = crate::cron::Schedule::At { at: run_at };
+
+        let job_name = name.unwrap_or_else(|| format!("eph-spawn-L{child_level}"));
+        let spawn_prompt = format!(
+            "[IPC spawned agent | trust_level={child_level} | session={session_id}]\n\n{prompt}"
+        );
+
+        let job = crate::cron::add_agent_job_full(
+            &self.config,
+            Some(job_name.clone()),
+            schedule,
+            &spawn_prompt,
+            crate::cron::SessionTarget::Isolated,
+            model,
+            None,
+            true,
+            crate::cron::ExecutionMode::Subprocess,
+            env_overlay,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create subprocess job: {e}"))?;
+
+        // 4. If wait=false, return immediately
+        if !wait {
+            return Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&json!({
+                    "spawned": true,
+                    "mode": "broker",
+                    "wait": false,
+                    "job_id": job.id,
+                    "agent_id": child_agent_id,
+                    "session_id": session_id,
+                    "name": job_name,
+                    "trust_level": child_level,
+                }))?,
+                error: None,
+            });
+        }
+
+        // 5. Wait mode: poll spawn-status with exponential backoff
+        let mut delay_ms = POLL_INITIAL_MS;
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(u64::from(timeout));
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(ToolResult {
+                    success: false,
+                    output: serde_json::to_string_pretty(&json!({
+                        "spawned": true,
+                        "mode": "broker",
+                        "wait": true,
+                        "status": "timeout",
+                        "agent_id": child_agent_id,
+                        "session_id": session_id,
+                    }))?,
+                    error: Some(format!("Spawn wait timed out after {timeout}s")),
+                });
+            }
+
+            let status_resp = client
+                .get(&format!("/api/ipc/spawn-status?session_id={session_id}"))
+                .await;
+
+            match status_resp {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    let status = body["status"].as_str().unwrap_or("unknown");
+
+                    match status {
+                        "completed" => {
+                            let result = body["result"].as_str().unwrap_or("").to_string();
+                            return Ok(ToolResult {
+                                success: true,
+                                output: serde_json::to_string_pretty(&json!({
+                                    "spawned": true,
+                                    "mode": "broker",
+                                    "wait": true,
+                                    "status": "completed",
+                                    "agent_id": child_agent_id,
+                                    "session_id": session_id,
+                                    "result": result,
+                                }))?,
+                                error: None,
+                            });
+                        }
+                        "running" => {
+                            // Keep polling
+                        }
+                        // Terminal states: timeout, revoked, error, interrupted
+                        _ => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: serde_json::to_string_pretty(&json!({
+                                    "spawned": true,
+                                    "mode": "broker",
+                                    "wait": true,
+                                    "status": status,
+                                    "agent_id": child_agent_id,
+                                    "session_id": session_id,
+                                }))?,
+                                error: Some(format!("Spawn ended with status: {status}")),
+                            });
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    tracing::warn!(
+                        session = session_id,
+                        status = %status,
+                        "spawn-status poll returned error, will retry"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session = session_id,
+                        error = %e,
+                        "spawn-status poll failed, will retry"
+                    );
+                }
+            }
+
+            delay_ms = (delay_ms * POLL_BACKOFF_FACTOR).min(POLL_MAX_MS);
         }
     }
 }
@@ -796,6 +1060,28 @@ mod tests {
         assert_eq!(spec.name, "agents_spawn");
         let required = spec.parameters["required"].as_array().unwrap();
         assert!(required.contains(&json!("prompt")));
+        // Verify Phase 3A parameters are present in schema
+        let props = spec.parameters["properties"].as_object().unwrap();
+        assert!(props.contains_key("wait"));
+        assert!(props.contains_key("timeout"));
+        assert!(props.contains_key("workload"));
+    }
+
+    #[test]
+    fn agents_spawn_with_broker_has_ipc_client() {
+        let config = Arc::new(crate::config::Config::default());
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let client = Arc::new(IpcClient::new("http://localhost:42617", "t", 10));
+        let tool = AgentsSpawnTool::with_broker(config, security, 1, client);
+        assert!(tool.ipc_client.is_some());
+    }
+
+    #[test]
+    fn agents_spawn_without_broker_has_no_ipc_client() {
+        let config = Arc::new(crate::config::Config::default());
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let tool = AgentsSpawnTool::new(config, security, 2);
+        assert!(tool.ipc_client.is_none());
     }
 
     #[test]

@@ -374,14 +374,22 @@ pub fn all_tools_with_runtime(
             tool_arcs.push(Arc::new(AgentsInboxTool::new(ipc_client.clone())));
             tool_arcs.push(Arc::new(AgentsReplyTool::new(ipc_client.clone())));
             tool_arcs.push(Arc::new(StateGetTool::new(ipc_client.clone())));
-            tool_arcs.push(Arc::new(StateSetTool::new(ipc_client)));
+            tool_arcs.push(Arc::new(StateSetTool::new(ipc_client.clone())));
+            // Broker-backed spawn: provision ephemeral identity + subprocess + wait
+            tool_arcs.push(Arc::new(AgentsSpawnTool::with_broker(
+                config.clone(),
+                security.clone(),
+                root_config.agents_ipc.trust_level,
+                ipc_client,
+            )));
+        } else {
+            // Legacy spawn: fire-and-forget in-process cron job (no broker)
+            tool_arcs.push(Arc::new(AgentsSpawnTool::new(
+                config.clone(),
+                security.clone(),
+                root_config.agents_ipc.trust_level,
+            )));
         }
-        // Spawn tool always available when IPC is enabled (local, no broker_token needed)
-        tool_arcs.push(Arc::new(AgentsSpawnTool::new(
-            config.clone(),
-            security.clone(),
-            root_config.agents_ipc.trust_level,
-        )));
     }
 
     // Add delegation tool when agents are configured
