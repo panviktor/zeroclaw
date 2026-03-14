@@ -797,11 +797,21 @@ Use a dedicated `kind=promoted_quarantine` that preserves origin. The key challe
 
 #### Schema change
 
-```sql
-ALTER TABLE messages ADD COLUMN promoted INTEGER DEFAULT 0;
+Add `promoted` column via an idempotent migration guard in `init_schema()`. SQLite does not support `ADD COLUMN IF NOT EXISTS`, so check `PRAGMA table_info` first:
+
+```rust
+// In IpcDb::init_schema(), after CREATE TABLE messages:
+let has_promoted: bool = conn
+    .prepare("PRAGMA table_info(messages)")?
+    .query_map([], |row| row.get::<_, String>(1))?
+    .any(|name| name.as_deref() == Ok("promoted"));
+
+if !has_promoted {
+    conn.execute_batch("ALTER TABLE messages ADD COLUMN promoted INTEGER DEFAULT 0;")?;
+}
 ```
 
-Add to `init_schema()`. The `fetch_inbox()` queries must exclude promoted messages from the quarantine lane:
+This is safe to run on every startup — fresh DBs get the column from `CREATE TABLE`, existing DBs get it via migration. The `fetch_inbox()` queries must exclude promoted messages from the quarantine lane:
 
 ```rust
 // quarantine=false: normal inbox — from_trust_level < 4 OR promoted = 1
@@ -1025,7 +1035,7 @@ PromptGuard and LeakDetector have complementary responsibilities:
 - **PromptGuard**: detects injection *intent* (system override, role confusion, jailbreak, command injection, tool injection, secret extraction requests)
 - **LeakDetector**: detects actual *credentials* (API keys, AWS keys, private keys, JWT, DB URLs, generic secrets, high-entropy tokens)
 
-Both apply to `handle_ipc_send()`. LeakDetector also applies to `handle_ipc_state_set()` (except `secret:*` namespace).
+Both apply to `handle_ipc_send()`. LeakDetector also applies to `handle_ipc_state_set()`. (Note: `secret:*` namespace is denied by ACL for all levels, so no exemption is needed.)
 
 ---
 
@@ -1056,7 +1066,7 @@ Both apply to `handle_ipc_send()`. LeakDetector also applies to `handle_ipc_stat
 | 1. Audit trail | Low | Additive — new event types, no existing behavior changed |
 | 2. PromptGuard | Medium | New rejection path in send handler — false positives possible; sensitivity threshold semantics (strict `>`) must be documented precisely |
 | 3. Structured output | Low | Additive fields in response — backward-compatible |
-| 4. LeakDetector scan | Medium | New rejection path in send AND state_set — false positives on high-entropy tokens possible; `secret:*` namespace exemption needed |
+| 4. LeakDetector scan | Medium | New rejection path in send AND state_set — false positives on high-entropy tokens possible |
 | 5. Sequence integrity | Low | Catch-only — logs error, does not fundamentally change insert path in happy case |
 | 6. Session limits | Medium | New rejection path — could block legitimate long sessions; escalation uses internal kind, not user-sendable |
 | 7. Promote-to-task | Low | New admin endpoint, localhost only; provenance preserved |
