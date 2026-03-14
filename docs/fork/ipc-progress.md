@@ -14,18 +14,16 @@ Execution owner: `Opus`
 | 1 | Config: AgentsIpcConfig + schema | config/schema.rs, config/mod.rs | DONE (2026-03-13) | — |
 | 2 | Pairing: TokenMetadata + authenticate() | security/pairing.rs | DONE (2026-03-13) | 1 |
 | 3 | Gateway plumbing: AppState + routes + IpcDb init | gateway/mod.rs, gateway/api.rs, gateway/ipc.rs | DONE (2026-03-13) | 1, 2 |
-| 4 | Broker core: IpcDb + schema + ACL | gateway/ipc.rs (new) | DONE (2026-03-13) | 3 |
-| 5 | Broker handlers: send, inbox, agents_list | gateway/ipc.rs | DONE (2026-03-13) | 4 |
+| 4 | Broker core: IpcDb + schema + ACL + unit tests | gateway/ipc.rs (new) | DONE (2026-03-13) | 3 |
+| 5 | Broker handlers: send, inbox, agents_list + tests | gateway/ipc.rs | DONE (2026-03-13) | 4 |
 | 6 | Broker handlers: state_get, state_set | gateway/ipc.rs | DONE (2026-03-13) | 4 |
 | 7 | Admin endpoints: revoke, disable, quarantine, downgrade | gateway/ipc.rs | DONE (2026-03-13) | 4 |
-| 8 | Tools: IpcClient + agents_list, agents_send, agents_inbox | tools/agents_ipc.rs (new) | DONE (2026-03-13) | 5 |
+| 8 | Tools: IpcClient + agents_list, agents_send, agents_inbox + registration + tests | tools/agents_ipc.rs (new), tools/mod.rs | DONE (2026-03-13) | 5 |
 | 9 | Tools: agents_reply, state_get, state_set | tools/agents_ipc.rs | DONE (2026-03-13) | 6, 8 |
 | 10 | Tools: agents_spawn | tools/agents_ipc.rs | DONE (2026-03-13) | 1 |
-| 11 | Tool registration + wizard | tools/mod.rs, onboard/wizard.rs | DONE (2026-03-13) | 8, 9, 10 |
-| 12 | Tests: ACL unit tests | gateway/ipc.rs #[cfg(test)] | DONE (2026-03-13) | 4 |
-| 13 | Tests: broker handler tests | gateway/ipc.rs #[cfg(test)] | DONE (2026-03-13) | 5, 6 |
-| 14 | Tests: tool HTTP client tests | tools/agents_ipc.rs #[cfg(test)] | DONE (2026-03-13) | 8, 9 |
-| 15 | Integration: cargo fmt + clippy + test | — | TODO | all |
+| 11 | Final validation: fmt + clippy + test + sync | — | TODO | all |
+
+> **Note on tests and registration**: Unit tests were written inline with each step (ACL tests in Step 4, handler tests in Steps 5-7, tool tests in Steps 8-10). Tool registration in `tools/mod.rs` and wizard defaults in `onboard/wizard.rs` were done as part of Steps 1 and 8. These are not separate steps.
 
 ## Step Details
 
@@ -87,11 +85,12 @@ Execution owner: `Opus`
 - `require_ipc_auth()` helper
 - `validate_send()` — Rules 0-5 (whitelist, L4 text-only, task-downward-only, correlated result, L4↔L4 denied, L3 text allowlist)
 - `validate_state_set()`, `validate_state_get()`
-- `IpcDb::session_has_task_for(session_id, agent_id) -> bool`
+- `IpcDb::session_has_request_for(session_id, agent_id) -> bool`
 - `IpcDb::update_last_seen(agent_id)`
 - Per-agent rate limiting helper
 - Structured error: `IpcErrorResponse { error, code, retryable }` + detail for L1-L2
 - Tracing events: structured IPC event logging
+- Unit tests: validate_send (kind, L4, task direction, result correlation, L4↔L4, L3 allowlist), validate_state_set/get, session_has_request_for
 
 **Verify**: `cargo check`
 
@@ -102,13 +101,14 @@ Execution owner: `Opus`
 ### Step 5: Broker handlers — send, inbox, agents_list
 
 **What**:
-- `handle_ipc_send()`: auth → rate limit → ACL → quarantine check → INSERT message → tracing event
+- `handle_ipc_send()`: auth → rate limit → L4 alias resolution → ACL → quarantine check → INSERT message → tracing event
 - `handle_ipc_inbox()`: auth → read rate limit → SELECT messages (quarantine param) → mark read → update last_seen → lazy TTL cleanup
-- `handle_ipc_agents()`: auth → L4 logical destinations vs full list → staleness check
+- `handle_ipc_agents()`: auth → L4 logical destination aliases (masked metadata) vs full list → staleness check
+- Tests: insert/fetch roundtrip, quarantine isolation, TTL cleanup
 
 **Verify**: `cargo check`
 
-**Notes**: Steps 5-7 implemented together. PR #12 on `feat/ipc-broker-handlers`. 40 tests total. Critical fix PR #13 followed: admin kill-switch effectiveness, query→result correlation, L4 topology masking, quarantine isolation.
+**Notes**: Steps 5-7 implemented together. PR #12 on `feat/ipc-broker-handlers`. 40 tests total. Critical fix PR #13 followed: admin kill-switch effectiveness, query→result correlation, L4 topology masking, quarantine isolation. PR #18: rate limiting enforcement, L4 alias abstraction, retroactive quarantine, token revocation.
 
 ---
 
@@ -147,10 +147,12 @@ Execution owner: `Opus`
 - `AgentsSendTool`: POST /api/ipc/send → { to, kind, payload, session_id?, priority? }
 - `AgentsInboxTool`: GET /api/ipc/inbox?quarantine=bool → messages + payload truncation (4000 chars)
 - All implement `Tool` trait: name, description, parameters (JsonSchema), execute
+- Tool registration: `pub mod agents_ipc;` + conditional registration in `all_tools_with_runtime()`
+- Tests: client URL handling, tool specs, payload truncation
 
 **Verify**: `cargo check`
 
-**Notes**: Steps 8-10 implemented together. PR #15 on `feat/ipc-tools`. 10 tool tests.
+**Notes**: Steps 8-10 implemented together. PR #15 on `feat/ipc-tools`. 10 tool tests. Registration: 6 HTTP tools require `broker_token`, `agents_spawn` only requires `enabled`.
 
 ---
 
@@ -182,62 +184,7 @@ Execution owner: `Opus`
 
 ---
 
-### Step 11: Registration + wizard
-
-**What**:
-- `src/tools/mod.rs`: `pub mod agents_ipc;` + conditional registration in `all_tools_with_runtime()`
-- `src/onboard/wizard.rs`: `agents_ipc: AgentsIpcConfig::default()`
-
-**Verify**: `cargo check`, `cargo test` (enabled=false → no tools registered → no impact)
-
-**Notes**: Done as part of Steps 1 (wizard) and 8 (mod.rs registration). 7 tools registered conditionally.
-
----
-
-### Step 12: Tests — ACL unit tests
-
-**What** (in `gateway/ipc.rs` `#[cfg(test)]`):
-- validate_send: kind whitelist, L4 text-only, task upward denied, task same-level denied, correlated result, L4↔L4 denied, L3 text allowlist
-- validate_state_set: L4 own namespace, L3 public, L2 team, L1 global, secret denied
-- validate_state_get: secret read ACL
-- IpcDb::session_has_task_for: true/false cases
-
-**Verify**: `cargo test -- ipc`
-
-**Notes**: Integrated into Steps 4 and fix PR #13. 50 tests in gateway/ipc.rs covering all ACL rules, state validation, admin operations.
-
----
-
-### Step 13: Tests — broker handler tests
-
-**What**:
-- Integration-style tests with test AppState + IpcDb (in-memory SQLite)
-- send → inbox round-trip
-- Quarantine flag for L4 messages
-- Rate limiting behavior
-- Error response format (no hints for low-trust)
-
-**Verify**: `cargo test -- ipc`
-
-**Notes**: Integrated into Steps 5-7. Tests: insert/fetch roundtrip, quarantine isolation, TTL cleanup, admin disable/downgrade.
-
----
-
-### Step 14: Tests — tool HTTP client tests
-
-**What**:
-- Mock HTTP server (or integration with real broker)
-- IpcClient construction with proxy
-- Tool parameter validation (JsonSchema)
-- Payload truncation in inbox tool
-
-**Verify**: `cargo test -- agents_ipc`
-
-**Notes**: Integrated into Steps 8-10. Tests: client URL handling, all 7 tool specs, payload truncation.
-
----
-
-### Step 15: Final validation
+### Step 11: Final validation
 
 **What**:
 - `cargo fmt --all -- --check`
@@ -265,3 +212,6 @@ Execution owner: `Opus`
 | 2026-03-13 | 3 | fix | Critical fixes: kill-switch, query→result, L4 masking, quarantine. PR #13 |
 | 2026-03-13 | 3 | fix | Sync script fixes (sed delimiter, workflow failures). PR #14 |
 | 2026-03-13 | 3 | 8, 9, 10 | All 7 IPC tools + registration. PR #15 |
+| 2026-03-14 | 4 | fix | Docs cross-references, progress tracker. PR #16 |
+| 2026-03-14 | 4 | sync | Upstream sync: 40 commits, 4 conflict resolutions. PR #17 |
+| 2026-03-14 | 4 | fix | 5 review findings: rate limiting, L4 aliases, spawn contract, revoke/quarantine, notify. PR #18 |
