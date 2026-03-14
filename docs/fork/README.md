@@ -10,13 +10,16 @@ This directory contains the strategy, plans, and operational docs for the ZeroCl
 | [delta-registry.md](delta-registry.md) | What is fork-only vs candidate-upstream, merge risk per item | Administrator, Opus |
 | [sync-review-rubric.md](sync-review-rubric.md) | Approve / Request changes / Escalate policy for sync PRs | Administrator |
 | [ipc-plan.md](ipc-plan.md) | Full IPC design: trust model, ACL, quarantine, approvals, phases | Everyone |
-| [ipc-progress.md](ipc-progress.md) | Step-by-step execution checklist (15 steps, Phase 1) | Opus |
+| [ipc-progress.md](ipc-progress.md) | Step-by-step execution checklist (11 steps, Phase 1) | Opus |
+| [ipc-quickstart.md](ipc-quickstart.md) | Minimal configs, pairing flow, smoke-test curl commands | Everyone |
 
 ## Reading order
 
 **New to the fork?** Start with `ipc-plan.md` → `sync-strategy.md` → `delta-registry.md`.
 
 **Starting IPC work?** Read `ipc-progress.md` first — find the next TODO step, then read the matching section in `ipc-plan.md`.
+
+**Setting up IPC locally?** Follow `ipc-quickstart.md` — configs, pairing, smoke tests.
 
 **Reviewing a sync PR?** Open `sync-review-rubric.md` and `delta-registry.md`.
 
