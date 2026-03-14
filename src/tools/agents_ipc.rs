@@ -936,6 +936,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: Some(db),
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,

@@ -314,6 +314,8 @@ pub struct AppState {
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Audit logger for persistent security event logging
+    pub audit_logger: Option<Arc<crate::security::AuditLogger>>,
     /// IPC broker database (None when agents_ipc.enabled = false)
     pub ipc_db: Option<Arc<ipc::IpcDb>>,
     /// IPC per-agent send rate limiter (None when IPC is disabled)
@@ -646,6 +648,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
 
+    // Audit logger for persistent security event logging
+    let audit_logger = if config.security.audit.enabled {
+        match crate::security::AuditLogger::new(
+            config.security.audit.clone(),
+            config.workspace_dir.clone(),
+        ) {
+            Ok(logger) => Some(Arc::new(logger)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize audit logger: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -670,6 +688,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         cost_tracker,
         event_tx,
         shutdown_tx,
+        audit_logger,
         ipc_db: None, // Initialized later when agents_ipc.enabled = true
         ipc_rate_limiter: if config.agents_ipc.enabled {
             Some(Arc::new(SlidingWindowRateLimiter::new(
@@ -1835,6 +1854,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -1890,6 +1910,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2269,6 +2290,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2338,6 +2360,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2419,6 +2442,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2472,6 +2496,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2530,6 +2555,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2593,6 +2619,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,
@@ -2652,6 +2679,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            audit_logger: None,
             ipc_db: None,
             ipc_rate_limiter: None,
             ipc_read_rate_limiter: None,

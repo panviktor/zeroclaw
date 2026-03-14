@@ -21,6 +21,13 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    IpcSend,
+    IpcBlocked,
+    IpcRateLimited,
+    IpcReceived,
+    IpcStateChange,
+    IpcAdminAction,
+    IpcLeakDetected,
 }
 
 /// Actor information (who performed the action)
@@ -134,6 +141,23 @@ impl AuditEvent {
             error,
         });
         self
+    }
+
+    /// Build an IPC audit event. `to_agent` and IPC-specific context are
+    /// encoded into the `action.command` field as a structured string.
+    pub fn ipc(
+        event_type: AuditEventType,
+        from_agent: &str,
+        to_agent: Option<&str>,
+        detail: &str,
+    ) -> Self {
+        let command = match to_agent {
+            Some(to) => format!("ipc: from={from_agent} to={to} {detail}"),
+            None => format!("ipc: from={from_agent} {detail}"),
+        };
+        Self::new(event_type)
+            .with_actor("ipc".to_string(), Some(from_agent.to_string()), None)
+            .with_action(command, "high".to_string(), false, true)
     }
 
     /// Set security context
