@@ -18,11 +18,44 @@ use axum::{
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+// ── Insert error type ───────────────────────────────────────────
+
+/// Error type for IPC message insertion, distinguishing sequence integrity
+/// violations from generic database errors.
+#[derive(Debug)]
+pub enum IpcInsertError {
+    /// Monotonic sequence integrity violation — possible DB corruption or rollback.
+    SequenceViolation { seq: i64, last_seq: i64 },
+    /// Generic database error.
+    Db(rusqlite::Error),
+}
+
+impl fmt::Display for IpcInsertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SequenceViolation { seq, last_seq } => {
+                write!(
+                    f,
+                    "Sequence integrity violation: seq={seq} <= last_seq={last_seq}"
+                )
+            }
+            Self::Db(e) => write!(f, "Database error: {e}"),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for IpcInsertError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Db(e)
+    }
+}
 
 // ── IpcDb (broker-owned SQLite) ─────────────────────────────────
 
@@ -193,7 +226,7 @@ impl IpcDb {
         session_id: Option<&str>,
         priority: i32,
         message_ttl_secs: Option<u64>,
-    ) -> Result<i64, rusqlite::Error> {
+    ) -> Result<i64, IpcInsertError> {
         let now = unix_now();
         let seq = self.next_seq(from_agent);
         let expires_at = message_ttl_secs.map(|ttl| now + ttl as i64);
@@ -202,24 +235,7 @@ impl IpcDb {
         // Sequence integrity check: verify monotonicity per sender-receiver pair.
         // Detects DB corruption or manual rollback (broker allocates seq, so this
         // is an integrity check, not transport-level replay protection).
-        let last_seq: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM messages
-                 WHERE from_agent = ?1 AND to_agent = ?2 AND blocked = 0",
-                params![from_agent, to_agent],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if seq <= last_seq {
-            warn!(
-                from = %from_agent,
-                to = %to_agent,
-                seq = seq,
-                last = last_seq,
-                "Sequence integrity violation — possible DB corruption"
-            );
-            return Err(rusqlite::Error::QueryReturnedNoRows); // signal error
-        }
+        Self::check_seq_integrity(&conn, from_agent, to_agent, seq)?;
 
         conn.execute(
             "INSERT INTO messages (session_id, from_agent, to_agent, kind, payload,
@@ -444,10 +460,12 @@ impl IpcDb {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT id, session_id, from_agent, to_agent, kind, payload,
-                    priority, from_trust_level, seq, created_at
+                    priority, from_trust_level, seq, created_at, promoted, read
              FROM messages WHERE id = ?1",
             params![id],
             |row| {
+                let promoted_i: i32 = row.get(10)?;
+                let read_i: i32 = row.get(11)?;
                 Ok(StoredMessage {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -459,10 +477,52 @@ impl IpcDb {
                     from_trust_level: row.get(7)?,
                     seq: row.get(8)?,
                     created_at: row.get(9)?,
+                    promoted: promoted_i != 0,
+                    read: read_i != 0,
                 })
             },
         )
         .ok()
+    }
+
+    /// Check whether an agent exists in the registry.
+    pub fn agent_exists(&self, agent_id: &str) -> bool {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT 1 FROM agents WHERE agent_id = ?1",
+            params![agent_id],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Check sequence integrity: seq must be strictly greater than the last
+    /// seq for this sender-receiver pair. Shared by all insert paths.
+    fn check_seq_integrity(
+        conn: &Connection,
+        from_agent: &str,
+        to_agent: &str,
+        seq: i64,
+    ) -> Result<(), IpcInsertError> {
+        let last_seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages
+                 WHERE from_agent = ?1 AND to_agent = ?2 AND blocked = 0",
+                params![from_agent, to_agent],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if seq <= last_seq {
+            warn!(
+                from = %from_agent,
+                to = %to_agent,
+                seq = seq,
+                last = last_seq,
+                "Sequence integrity violation — possible DB corruption"
+            );
+            return Err(IpcInsertError::SequenceViolation { seq, last_seq });
+        }
+        Ok(())
     }
 
     /// Insert a promoted message (escapes quarantine lane via promoted=1).
@@ -476,11 +536,15 @@ impl IpcDb {
         session_id: Option<&str>,
         priority: i32,
         message_ttl_secs: Option<u64>,
-    ) -> Result<i64, rusqlite::Error> {
+    ) -> Result<i64, IpcInsertError> {
         let now = unix_now();
         let seq = self.next_seq(from_agent);
         let expires_at = message_ttl_secs.map(|ttl| now + ttl as i64);
         let conn = self.conn.lock();
+
+        // Same sequence integrity check as insert_message
+        Self::check_seq_integrity(&conn, from_agent, to_agent, seq)?;
+
         conn.execute(
             "INSERT INTO messages (session_id, from_agent, to_agent, kind, payload,
              priority, from_trust_level, seq, created_at, expires_at, promoted)
@@ -517,6 +581,8 @@ pub struct StoredMessage {
     pub from_trust_level: u8,
     pub seq: i64,
     pub created_at: i64,
+    pub promoted: bool,
+    pub read: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -971,12 +1037,16 @@ pub async fn handle_ipc_send(
     if let Some(ref limiter) = state.ipc_rate_limiter {
         if !limiter.allow(&meta.agent_id) {
             if let Some(ref logger) = state.audit_logger {
-                let _ = logger.log(&AuditEvent::ipc(
+                let mut event = AuditEvent::ipc(
                     AuditEventType::IpcRateLimited,
                     &meta.agent_id,
                     None,
                     "send rate limit exceeded",
-                ));
+                );
+                if let Some(a) = event.action.as_mut() {
+                    a.allowed = false;
+                }
+                let _ = logger.log(&event);
             }
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1063,12 +1133,16 @@ pub async fn handle_ipc_send(
             match guard.scan(&body.payload) {
                 GuardResult::Blocked(reason) => {
                     if let Some(ref logger) = state.audit_logger {
-                        let _ = logger.log(&AuditEvent::ipc(
+                        let mut event = AuditEvent::ipc(
                             AuditEventType::IpcBlocked,
                             &meta.agent_id,
                             Some(&resolved_to),
                             &format!("prompt_guard_blocked: {reason}"),
-                        ));
+                        );
+                        if let Some(a) = event.action.as_mut() {
+                            a.allowed = false;
+                        }
+                        let _ = logger.log(&event);
                     }
                     return Err((
                         StatusCode::FORBIDDEN,
@@ -1087,14 +1161,8 @@ pub async fn handle_ipc_send(
                         patterns = ?patterns,
                         "IPC message suspicious but allowed"
                     );
-                    if let Some(ref logger) = state.audit_logger {
-                        let _ = logger.log(&AuditEvent::ipc(
-                            AuditEventType::IpcSend,
-                            &meta.agent_id,
-                            Some(&resolved_to),
-                            &format!("suspicious: score={score:.2}, patterns={patterns:?}"),
-                        ));
-                    }
+                    // No separate audit event here — the post-insert IpcSend
+                    // audit is authoritative. Suspicious detail captured by tracing.
                 }
                 GuardResult::Safe => {}
             }
@@ -1105,12 +1173,16 @@ pub async fn handle_ipc_send(
     if let Some(ref detector) = state.ipc_leak_detector {
         if let LeakResult::Detected { patterns, .. } = detector.scan(&body.payload) {
             if let Some(ref logger) = state.audit_logger {
-                let _ = logger.log(&AuditEvent::ipc(
+                let mut event = AuditEvent::ipc(
                     AuditEventType::IpcLeakDetected,
                     &meta.agent_id,
                     Some(&resolved_to),
                     &format!("credential_leak: {patterns:?}"),
-                ));
+                );
+                if let Some(a) = event.action.as_mut() {
+                    a.allowed = false;
+                }
+                let _ = logger.log(&event);
             }
             return Err((
                 StatusCode::FORBIDDEN,
@@ -1188,13 +1260,39 @@ pub async fn handle_ipc_send(
         )
         .map_err(|e| {
             warn!(error = %e, "IPC insert_message failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Failed to store message",
-                    "code": "db_error"
-                })),
-            )
+            match &e {
+                IpcInsertError::SequenceViolation { seq, last_seq } => {
+                    if let Some(ref logger) = state.audit_logger {
+                        let mut event = AuditEvent::ipc(
+                            AuditEventType::IpcBlocked,
+                            &meta.agent_id,
+                            Some(&resolved_to),
+                            &format!(
+                                "sequence_integrity_violation: seq={seq}, last_seq={last_seq}"
+                            ),
+                        );
+                        if let Some(a) = event.action.as_mut() {
+                            a.allowed = false;
+                        }
+                        let _ = logger.log(&event);
+                    }
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "Sequence integrity violation",
+                            "code": "sequence_violation",
+                            "retryable": false
+                        })),
+                    )
+                }
+                IpcInsertError::Db(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to store message",
+                        "code": "db_error"
+                    })),
+                ),
+            }
         })?;
 
     info!(
@@ -1255,6 +1353,22 @@ pub async fn handle_ipc_inbox(
         }
     }
 
+    // Audit: log IpcReceived for each fetched message
+    if !messages.is_empty() {
+        if let Some(ref logger) = state.audit_logger {
+            let _ = logger.log(&AuditEvent::ipc(
+                AuditEventType::IpcReceived,
+                &meta.agent_id,
+                None,
+                &format!(
+                    "inbox: count={}, quarantine={}",
+                    messages.len(),
+                    query.quarantine
+                ),
+            ));
+        }
+    }
+
     Ok(Json(serde_json::json!({ "messages": messages })))
 }
 
@@ -1295,7 +1409,7 @@ pub async fn handle_ipc_state_set(
     if let Some(ref detector) = state.ipc_leak_detector {
         if let LeakResult::Detected { patterns, .. } = detector.scan(&body.value) {
             if let Some(ref logger) = state.audit_logger {
-                let _ = logger.log(&AuditEvent::ipc(
+                let mut event = AuditEvent::ipc(
                     AuditEventType::IpcLeakDetected,
                     &meta.agent_id,
                     None,
@@ -1303,7 +1417,11 @@ pub async fn handle_ipc_state_set(
                         "credential_leak in state_set key={}: {patterns:?}",
                         body.key
                     ),
-                ));
+                );
+                if let Some(a) = event.action.as_mut() {
+                    a.allowed = false;
+                }
+                let _ = logger.log(&event);
             }
             return Err((
                 StatusCode::FORBIDDEN,
@@ -1498,12 +1616,42 @@ pub async fn handle_admin_ipc_promote(
         )
     })?;
 
+    // Validate: message must be in quarantine lane (L4, not promoted, not read)
     if msg.from_trust_level < 4 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "Only quarantine messages can be promoted",
+                "error": "Only quarantine messages (from_trust_level >= 4) can be promoted",
                 "code": "not_quarantine"
+            })),
+        ));
+    }
+    if msg.promoted {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Message has already been promoted",
+                "code": "already_promoted"
+            })),
+        ));
+    }
+    if msg.read {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Message has already been read and cannot be promoted",
+                "code": "already_read"
+            })),
+        ));
+    }
+
+    // Validate: target agent must exist in the registry
+    if !db.agent_exists(&body.to_agent) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("Target agent '{}' not found", body.to_agent),
+                "code": "unknown_recipient"
             })),
         ));
     }
@@ -1538,13 +1686,22 @@ pub async fn handle_admin_ipc_promote(
         )
         .map_err(|e| {
             warn!(error = %e, "Failed to insert promoted message");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Failed to promote message",
-                    "code": "db_error"
-                })),
-            )
+            match e {
+                IpcInsertError::SequenceViolation { .. } => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Sequence integrity violation during promote",
+                        "code": "sequence_violation"
+                    })),
+                ),
+                IpcInsertError::Db(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to promote message",
+                        "code": "db_error"
+                    })),
+                ),
+            }
         })?;
 
     info!(
@@ -2610,5 +2767,92 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].from_trust_level, 4, "trust level must be preserved");
         assert_eq!(msgs[0].from_agent, "kids", "from_agent must be preserved");
+    }
+
+    // ── Review findings fix tests ─────────────────────────────────
+
+    #[test]
+    fn get_message_includes_promoted_and_read() {
+        let db = test_db();
+        db.update_last_seen("kids", 4, "restricted");
+        db.update_last_seen("opus", 1, "coordinator");
+        let id = db
+            .insert_message("kids", "opus", "text", "hello", 4, None, 0, None)
+            .unwrap();
+        let msg = db.get_message(id).unwrap();
+        assert!(!msg.promoted, "new message should not be promoted");
+        assert!(!msg.read, "new message should not be read");
+
+        // Mark as read via fetch_inbox
+        db.fetch_inbox("opus", true, 50);
+        let msg2 = db.get_message(id).unwrap();
+        assert!(msg2.read, "fetched message should be marked read");
+    }
+
+    #[test]
+    fn agent_exists_checks_registry() {
+        let db = test_db();
+        assert!(!db.agent_exists("nobody"));
+        db.update_last_seen("opus", 1, "coordinator");
+        assert!(db.agent_exists("opus"));
+    }
+
+    #[test]
+    fn seq_integrity_in_promoted_insert() {
+        let db = test_db();
+        db.update_last_seen("kids", 4, "restricted");
+        db.update_last_seen("opus", 1, "coordinator");
+        // Normal insert
+        db.insert_promoted_message("kids", "opus", PROMOTED_KIND, "m1", 4, None, 0, None)
+            .unwrap();
+        // Corrupt seq counter
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE message_sequences SET last_seq = 0 WHERE agent_id = 'kids'",
+                [],
+            )
+            .unwrap();
+        }
+        // Must detect corruption
+        let result =
+            db.insert_promoted_message("kids", "opus", PROMOTED_KIND, "m2", 4, None, 0, None);
+        assert!(
+            matches!(result, Err(IpcInsertError::SequenceViolation { .. })),
+            "promoted insert must check seq integrity"
+        );
+    }
+
+    #[test]
+    fn seq_integrity_returns_typed_error() {
+        let db = test_db();
+        db.update_last_seen("a", 3, "worker");
+        db.update_last_seen("b", 3, "worker");
+        db.insert_message("a", "b", "text", "msg1", 3, None, 0, None)
+            .unwrap();
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE message_sequences SET last_seq = 0 WHERE agent_id = 'a'",
+                [],
+            )
+            .unwrap();
+        }
+        let result = db.insert_message("a", "b", "text", "msg2", 3, None, 0, None);
+        assert!(
+            matches!(result, Err(IpcInsertError::SequenceViolation { .. })),
+            "must return SequenceViolation, not generic Db error"
+        );
+    }
+
+    #[test]
+    fn sanitize_guard_action_maps_to_block() {
+        use crate::security::GuardAction;
+        let action = GuardAction::from_str("sanitize");
+        assert_eq!(
+            action,
+            GuardAction::Block,
+            "sanitize must be treated as block"
+        );
     }
 }

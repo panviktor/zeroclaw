@@ -41,8 +41,9 @@ pub enum GuardAction {
 impl GuardAction {
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "block" => Self::Block,
-            "sanitize" => Self::Sanitize,
+            // "sanitize" mode is not implemented — treat as "block" to prevent
+            // silent pass-through of suspicious payloads.
+            "block" | "sanitize" => Self::Block,
             _ => Self::Warn,
         }
     }
