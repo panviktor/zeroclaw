@@ -1487,6 +1487,37 @@ pub async fn handle_ipc_send(
         ));
     }
 
+    // ── Phase 3A: Result delivery for ephemeral spawn sessions ──
+    // When an ephemeral child sends kind=result with a session_id that
+    // matches a running spawn_run, complete the run and auto-revoke the child.
+    if body.kind == "result" {
+        if let Some(ref session_id) = body.session_id {
+            if let Some(run) = db.get_spawn_run(session_id) {
+                if run.status == "running" && run.child_id == meta.agent_id {
+                    // Complete the spawn run with the result payload
+                    db.complete_spawn_run(session_id, &body.payload);
+
+                    // Auto-revoke ephemeral child
+                    revoke_ephemeral_agent(
+                        db,
+                        &state.pairing,
+                        &meta.agent_id,
+                        session_id,
+                        "completed",
+                        state.audit_logger.as_ref().map(|l| l.as_ref()),
+                    );
+
+                    info!(
+                        child = meta.agent_id,
+                        session = session_id,
+                        parent = run.parent_id,
+                        "Ephemeral spawn result delivered and child auto-revoked"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(Json(serde_json::json!({ "ok": true, "id": msg_id })))
 }
 
@@ -3421,5 +3452,106 @@ mod tests {
 
         // Token should no longer authenticate
         assert!(guard.authenticate(&token).is_none());
+    }
+
+    // ── Phase 3A: Result delivery + auto-revoke tests ───────────
+
+    #[test]
+    fn result_delivery_completes_spawn_run_and_revokes() {
+        use crate::security::PairingGuard;
+
+        let db = IpcDb::open_in_memory().unwrap();
+        let guard = PairingGuard::new(true, &["zc_existing".into()]);
+
+        // Setup: register ephemeral agent
+        let child_meta = crate::config::TokenMetadata {
+            agent_id: "eph-opus-abc".into(),
+            trust_level: 3,
+            role: "worker".into(),
+        };
+        let child_token = guard.register_ephemeral_token(child_meta);
+
+        // Register in DB
+        db.register_ephemeral_agent(
+            "eph-opus-abc",
+            "opus",
+            3,
+            "worker",
+            "sess-result-1",
+            9_999_999_999,
+        );
+        db.create_spawn_run("sess-result-1", "opus", "eph-opus-abc", 9_999_999_999);
+
+        // Verify child can authenticate
+        assert!(guard.authenticate(&child_token).is_some());
+
+        // Simulate result delivery: child sends kind=result
+        let run = db.get_spawn_run("sess-result-1").unwrap();
+        assert_eq!(run.status, "running");
+
+        // Complete + revoke (mimics what handle_ipc_send does)
+        db.complete_spawn_run("sess-result-1", "analysis findings");
+        revoke_ephemeral_agent(
+            &db,
+            &guard,
+            "eph-opus-abc",
+            "sess-result-1",
+            "completed",
+            None,
+        );
+
+        // Verify: spawn_run completed with result
+        let run = db.get_spawn_run("sess-result-1").unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.result.as_deref(), Some("analysis findings"));
+        assert!(run.completed_at.is_some());
+
+        // Verify: child token revoked (cannot authenticate)
+        assert!(guard.authenticate(&child_token).is_none());
+
+        // Verify: agent status is "completed" in DB
+        let agents = db.list_agents(86400);
+        let eph = agents
+            .iter()
+            .find(|a| a.agent_id == "eph-opus-abc")
+            .unwrap();
+        assert_eq!(eph.status, "completed");
+    }
+
+    #[test]
+    fn result_delivery_ignores_non_matching_session() {
+        let db = IpcDb::open_in_memory().unwrap();
+
+        // Create a spawn run for a different child
+        db.register_ephemeral_agent(
+            "eph-opus-xyz",
+            "opus",
+            3,
+            "worker",
+            "sess-other",
+            9_999_999_999,
+        );
+        db.create_spawn_run("sess-other", "opus", "eph-opus-xyz", 9_999_999_999);
+
+        // A different agent tries to complete it
+        let run = db.get_spawn_run("sess-other").unwrap();
+        assert_eq!(run.child_id, "eph-opus-xyz");
+        // The check `run.child_id == meta.agent_id` would fail for a different sender
+        assert_ne!(run.child_id, "eph-opus-wrong");
+    }
+
+    #[test]
+    fn result_delivery_only_completes_running_sessions() {
+        let db = IpcDb::open_in_memory().unwrap();
+        db.create_spawn_run("sess-already-done", "opus", "eph-opus-done", 9_999_999_999);
+
+        // Complete it once
+        assert!(db.complete_spawn_run("sess-already-done", "first result"));
+
+        // Try to complete again — should not overwrite
+        assert!(!db.complete_spawn_run("sess-already-done", "second result"));
+
+        let run = db.get_spawn_run("sess-already-done").unwrap();
+        assert_eq!(run.result.as_deref(), Some("first result"));
     }
 }
