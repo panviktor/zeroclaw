@@ -187,6 +187,29 @@ impl IpcDb {
         let seq = self.next_seq(from_agent);
         let expires_at = message_ttl_secs.map(|ttl| now + ttl as i64);
         let conn = self.conn.lock();
+
+        // Sequence integrity check: verify monotonicity per sender-receiver pair.
+        // Detects DB corruption or manual rollback (broker allocates seq, so this
+        // is an integrity check, not transport-level replay protection).
+        let last_seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages
+                 WHERE from_agent = ?1 AND to_agent = ?2 AND blocked = 0",
+                params![from_agent, to_agent],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if seq <= last_seq {
+            warn!(
+                from = %from_agent,
+                to = %to_agent,
+                seq = seq,
+                last = last_seq,
+                "Sequence integrity violation — possible DB corruption"
+            );
+            return Err(rusqlite::Error::QueryReturnedNoRows); // signal error
+        }
+
         conn.execute(
             "INSERT INTO messages (session_id, from_agent, to_agent, kind, payload,
              priority, from_trust_level, seq, created_at, expires_at)
@@ -2129,5 +2152,53 @@ mod tests {
         let detector = crate::security::LeakDetector::with_sensitivity(0.7);
         let result = detector.scan("password=SuperSecretLongPassword123!");
         assert!(matches!(result, LeakResult::Detected { .. }));
+    }
+
+    // ── Sequence integrity tests ────────────────────────────────
+
+    #[test]
+    fn seq_integrity_sequential_inserts_ok() {
+        let db = test_db();
+        db.update_last_seen("a", 3, "worker");
+        db.update_last_seen("b", 3, "worker");
+        let r1 = db.insert_message("a", "b", "text", "msg1", 3, None, 0, None);
+        let r2 = db.insert_message("a", "b", "text", "msg2", 3, None, 0, None);
+        let r3 = db.insert_message("a", "b", "text", "msg3", 3, None, 0, None);
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        assert!(r3.is_ok());
+    }
+
+    #[test]
+    fn seq_integrity_different_pairs_independent() {
+        let db = test_db();
+        db.update_last_seen("a", 3, "worker");
+        db.update_last_seen("b", 3, "worker");
+        db.update_last_seen("c", 3, "worker");
+        // a→b and a→c use the same sender seq counter but different pair checks
+        assert!(db.insert_message("a", "b", "text", "msg1", 3, None, 0, None).is_ok());
+        assert!(db.insert_message("a", "c", "text", "msg2", 3, None, 0, None).is_ok());
+        assert!(db.insert_message("a", "b", "text", "msg3", 3, None, 0, None).is_ok());
+    }
+
+    #[test]
+    fn seq_integrity_detects_corruption() {
+        let db = test_db();
+        db.update_last_seen("a", 3, "worker");
+        db.update_last_seen("b", 3, "worker");
+        // Insert normally
+        db.insert_message("a", "b", "text", "msg1", 3, None, 0, None).unwrap();
+        // Manually corrupt: set message_sequences back so next_seq returns a lower value
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE message_sequences SET last_seq = 0 WHERE agent_id = 'a'",
+                [],
+            )
+            .unwrap();
+        }
+        // Next insert should detect seq <= last_seq in messages table
+        let result = db.insert_message("a", "b", "text", "msg2", 3, None, 0, None);
+        assert!(result.is_err(), "corruption must be detected");
     }
 }
