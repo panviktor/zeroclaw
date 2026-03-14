@@ -87,7 +87,7 @@ fn hash_webhook_secret(value: &str) -> String {
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 #[derive(Debug)]
-struct SlidingWindowRateLimiter {
+pub struct SlidingWindowRateLimiter {
     limit_per_window: u32,
     window: Duration,
     max_keys: usize,
@@ -316,6 +316,10 @@ pub struct AppState {
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// IPC broker database (None when agents_ipc.enabled = false)
     pub ipc_db: Option<Arc<ipc::IpcDb>>,
+    /// IPC per-agent send rate limiter (None when IPC is disabled)
+    pub ipc_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    /// IPC per-agent read rate limiter (None when IPC is disabled)
+    pub ipc_read_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
 }
@@ -666,7 +670,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         cost_tracker,
         event_tx,
         shutdown_tx,
-        ipc_db: None, // Initialized in Step 4 when agents_ipc.enabled = true
+        ipc_db: None, // Initialized later when agents_ipc.enabled = true
+        ipc_rate_limiter: if config.agents_ipc.enabled {
+            Some(Arc::new(SlidingWindowRateLimiter::new(
+                config.agents_ipc.max_messages_per_hour,
+                Duration::from_secs(3600),
+                256,
+            )))
+        } else {
+            None
+        },
+        ipc_read_rate_limiter: if config.agents_ipc.enabled {
+            Some(Arc::new(SlidingWindowRateLimiter::new(
+                config.agents_ipc.max_messages_per_hour * 5, // reads are cheaper
+                Duration::from_secs(3600),
+                256,
+            )))
+        } else {
+            None
+        },
         node_registry,
     };
 
@@ -1814,6 +1836,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
@@ -1867,6 +1891,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
@@ -2244,6 +2270,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
@@ -2311,6 +2339,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
@@ -2390,6 +2420,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
@@ -2441,6 +2473,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
@@ -2497,6 +2531,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
@@ -2558,6 +2594,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
@@ -2615,6 +2653,8 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             ipc_db: None,
+            ipc_rate_limiter: None,
+            ipc_read_rate_limiter: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 

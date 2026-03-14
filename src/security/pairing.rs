@@ -278,6 +278,28 @@ impl PairingGuard {
             .insert(code.to_string(), metadata);
     }
 
+    /// Revoke all tokens belonging to a given agent_id.
+    ///
+    /// Removes matching tokens from `paired_tokens` and `token_metadata`,
+    /// so subsequent `authenticate()` / `is_authenticated()` calls fail.
+    /// Returns the number of tokens revoked.
+    pub fn revoke_by_agent_id(&self, agent_id: &str) -> usize {
+        let mut meta = self.token_metadata.lock();
+        let hashes_to_remove: Vec<String> = meta
+            .iter()
+            .filter(|(_, m)| m.agent_id == agent_id)
+            .map(|(h, _)| h.clone())
+            .collect();
+        for hash in &hashes_to_remove {
+            meta.remove(hash);
+        }
+        let mut tokens = self.paired_tokens.lock();
+        for hash in &hashes_to_remove {
+            tokens.remove(hash);
+        }
+        hashes_to_remove.len()
+    }
+
     /// Generate a new pairing code, even if already paired.
     ///
     /// This allows adding additional clients without restarting the gateway.

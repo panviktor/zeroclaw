@@ -1304,9 +1304,12 @@ pub struct AgentsIpcConfig {
     #[serde(default)]
     pub lateral_text_pairs: Vec<[String; 2]>,
 
-    /// Logical destination names visible to L4 agents (restricts agents_list output).
+    /// Logical destination aliases visible to L4 agents.
+    /// Maps alias → real agent_id. L4 agents see only alias names with masked
+    /// metadata; the broker resolves aliases to real agent_ids transparently.
+    /// Example: `{ "supervisor" = "opus", "escalation" = "sentinel" }`
     #[serde(default)]
-    pub l4_destinations: Vec<String>,
+    pub l4_destinations: HashMap<String, String>,
 }
 
 fn default_broker_url() -> String {
@@ -1350,7 +1353,7 @@ impl Default for AgentsIpcConfig {
             max_messages_per_hour: default_max_messages_per_hour(),
             request_timeout_secs: default_ipc_request_timeout_secs(),
             lateral_text_pairs: Vec::new(),
-            l4_destinations: Vec::new(),
+            l4_destinations: HashMap::new(),
         }
     }
 }

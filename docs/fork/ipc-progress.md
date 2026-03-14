@@ -127,9 +127,9 @@ Execution owner: `Opus`
 ### Step 7: Admin endpoints
 
 **What**:
-- `handle_admin_ipc_revoke()`: localhost check → remove token → block pending messages → close sessions → audit
+- `handle_admin_ipc_revoke()`: localhost check → block pending messages → revoke bearer token via `PairingGuard::revoke_by_agent_id()` → set status=revoked → audit
 - `handle_admin_ipc_disable()`: localhost → status=disabled, messages blocked, token preserved
-- `handle_admin_ipc_quarantine()`: localhost → trust_level→4, messages → quarantine
+- `handle_admin_ipc_quarantine()`: localhost → trust_level→4, retroactive `quarantine_pending_messages()` (moves unread messages to quarantine lane) → status=quarantined
 - `handle_admin_ipc_downgrade()`: localhost → only downgrade (new_level > current)
 - `handle_admin_ipc_agents()`: localhost → full agent list with metadata
 
@@ -171,13 +171,14 @@ Execution owner: `Opus`
 
 **What**:
 - `AgentsSpawnTool`: local (no IpcClient), uses `cron::add_agent_job()`
-- Parameters: prompt, model, session_id, wait_for_result, timeout_secs
+- Parameters: prompt (required), name (optional), model (optional), trust_level (optional, 0-4)
 - Trust propagation: `child_level = max(requested, parent_level)` (convention-based Phase 1)
 - security.can_act() check
+- Phase 2 planned: session_id, wait_for_result, timeout_secs (not yet implemented)
 
 **Verify**: `cargo check`
 
-**Notes**: See Step 8 notes. Uses `cron::Schedule::At` for one-shot immediate execution with `delete_after_run=true`.
+**Notes**: See Step 8 notes. Uses `cron::Schedule::At` for one-shot immediate execution with `delete_after_run=true`. Fire-and-forget in Phase 1; synchronous wait is deferred to Phase 2.
 
 ---
 

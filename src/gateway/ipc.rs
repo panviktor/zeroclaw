@@ -291,7 +291,7 @@ impl IpcDb {
             Ok(AgentInfo {
                 agent_id: row.get(0)?,
                 role: row.get(1)?,
-                trust_level: row.get(2)?,
+                trust_level: Some(row.get(2)?),
                 status: effective_status,
                 last_seen,
             })
@@ -365,6 +365,19 @@ impl IpcDb {
         Some(current)
     }
 
+    /// Retroactively move unread messages from an agent into the quarantine lane.
+    /// Sets `from_trust_level = 4` on all unread, unblocked messages from this agent,
+    /// so they appear in quarantine inbox rather than the normal inbox.
+    pub fn quarantine_pending_messages(&self, agent_id: &str) -> usize {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE messages SET from_trust_level = 4
+             WHERE from_agent = ?1 AND read = 0 AND blocked = 0 AND from_trust_level < 4",
+            params![agent_id],
+        )
+        .unwrap_or(0)
+    }
+
     /// Block pending messages for an agent (used by revoke/disable).
     pub fn block_pending_messages(&self, agent_id: &str, reason: &str) {
         let conn = self.conn.lock();
@@ -423,7 +436,8 @@ pub struct InboxMessage {
 pub struct AgentInfo {
     pub agent_id: String,
     pub role: Option<String>,
-    pub trust_level: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_level: Option<u8>,
     pub status: String,
     pub last_seen: Option<i64>,
 }
@@ -461,7 +475,7 @@ pub struct AdminDowngradeBody {
 // ── ACL validation ──────────────────────────────────────────────
 
 /// Allowed message kinds.
-const VALID_KINDS: &[&str] = &["text", "task", "result", "query", "notify"];
+const VALID_KINDS: &[&str] = &["text", "task", "result", "query"];
 
 /// Validate whether a send operation is permitted by the ACL rules.
 ///
@@ -472,6 +486,7 @@ const VALID_KINDS: &[&str] = &["text", "task", "result", "query", "notify"];
 /// 3. `result` requires a correlated task in the same session.
 /// 4. L4↔L4 direct messaging is denied (must go through a higher-trust agent).
 /// 5. L3 lateral `text` requires an explicit allowlist entry.
+#[allow(clippy::implicit_hasher)]
 pub fn validate_send(
     from_level: u8,
     to_level: u8,
@@ -480,7 +495,7 @@ pub fn validate_send(
     to_agent: &str,
     session_id: Option<&str>,
     lateral_text_pairs: &[[String; 2]],
-    l4_destinations: &[String],
+    l4_destinations: &std::collections::HashMap<String, String>,
     db: &IpcDb,
 ) -> Result<(), IpcError> {
     // Rule 0: kind whitelist
@@ -503,8 +518,8 @@ pub fn validate_send(
         });
     }
 
-    // L4 destination whitelist
-    if from_level >= 4 && !l4_destinations.contains(&to_agent.to_string()) {
+    // L4 destination whitelist (to_agent is already resolved from alias)
+    if from_level >= 4 && !l4_destinations.values().any(|v| v == to_agent) {
         return Err(IpcError {
             status: StatusCode::FORBIDDEN,
             error: "Destination not in L4 allowlist".into(),
@@ -755,16 +770,18 @@ pub async fn handle_ipc_agents(
     let staleness = state.config.lock().agents_ipc.staleness_secs;
     let agents = db.list_agents(staleness);
 
-    // L4 agents only see their configured destinations with masked metadata
+    // L4 agents see only logical aliases with fully masked metadata.
+    // Real agent_ids, roles, and trust_levels are hidden from restricted agents.
     let agents: Vec<AgentInfo> = if meta.trust_level >= 4 {
         let l4_dests = &state.config.lock().agents_ipc.l4_destinations;
-        agents
-            .into_iter()
-            .filter(|a| l4_dests.contains(&a.agent_id))
-            .map(|a| AgentInfo {
+        l4_dests
+            .keys()
+            .map(|alias| AgentInfo {
+                agent_id: alias.clone(),
                 role: None,
-                trust_level: 0, // masked
-                ..a
+                trust_level: None,
+                status: "available".into(),
+                last_seen: None,
             })
             .collect()
     } else {
@@ -785,13 +802,47 @@ pub async fn handle_ipc_send(
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
     require_agent_active(db, &meta.agent_id)?;
 
-    // Resolve recipient trust level — reject unknown recipients
+    // Per-agent send rate limiting
+    if let Some(ref limiter) = state.ipc_rate_limiter {
+        if !limiter.allow(&meta.agent_id) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "Rate limit exceeded",
+                    "code": "rate_limited",
+                    "retryable": true
+                })),
+            ));
+        }
+    }
+
+    // Resolve recipient — L4 agents may use logical aliases
     let config = state.config.lock();
+    let resolved_to = if meta.trust_level >= 4 {
+        // Resolve alias → real agent_id; reject if alias is not configured
+        config
+            .agents_ipc
+            .l4_destinations
+            .get(&body.to)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Unknown destination",
+                        "code": "unknown_recipient"
+                    })),
+                )
+            })?
+    } else {
+        body.to.clone()
+    };
+
     let to_level = db
         .list_agents(config.agents_ipc.staleness_secs)
         .iter()
-        .find(|a| a.agent_id == body.to)
-        .map(|a| a.trust_level)
+        .find(|a| a.agent_id == resolved_to)
+        .and_then(|a| a.trust_level)
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -808,7 +859,7 @@ pub async fn handle_ipc_send(
         to_level,
         &body.kind,
         &meta.agent_id,
-        &body.to,
+        &resolved_to,
         body.session_id.as_deref(),
         &config.agents_ipc.lateral_text_pairs,
         &config.agents_ipc.l4_destinations,
@@ -822,7 +873,7 @@ pub async fn handle_ipc_send(
     let msg_id = db
         .insert_message(
             &meta.agent_id,
-            &body.to,
+            &resolved_to,
             &body.kind,
             &body.payload,
             meta.trust_level,
@@ -843,7 +894,7 @@ pub async fn handle_ipc_send(
 
     info!(
         from = meta.agent_id,
-        to = body.to,
+        to = %resolved_to,
         kind = body.kind,
         msg_id = msg_id,
         "IPC message sent"
@@ -862,6 +913,20 @@ pub async fn handle_ipc_inbox(
     let meta = require_ipc_auth(&state, &headers)?;
     db.update_last_seen(&meta.agent_id, meta.trust_level, &meta.role);
     require_agent_active(db, &meta.agent_id)?;
+
+    // Per-agent read rate limiting
+    if let Some(ref limiter) = state.ipc_read_rate_limiter {
+        if !limiter.allow(&meta.agent_id) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "Rate limit exceeded",
+                    "code": "rate_limited",
+                    "retryable": true
+                })),
+            ));
+        }
+    }
 
     let messages = db.fetch_inbox(&meta.agent_id, query.quarantine, query.limit);
 
@@ -921,7 +986,7 @@ pub async fn handle_admin_ipc_agents(
     Ok(Json(serde_json::json!({ "agents": agents })))
 }
 
-/// POST /admin/ipc/revoke — revoke an agent (block messages, set status=revoked).
+/// POST /admin/ipc/revoke — revoke an agent (block messages, revoke token, set status=revoked).
 pub async fn handle_admin_ipc_revoke(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -931,10 +996,20 @@ pub async fn handle_admin_ipc_revoke(
     let db = require_ipc_db(&state)?;
     db.block_pending_messages(&body.agent_id, "agent_revoked");
     let found = db.set_agent_status(&body.agent_id, "revoked");
+    // True token revocation: remove from PairingGuard so authenticate() fails
+    let tokens_revoked = state.pairing.revoke_by_agent_id(&body.agent_id);
     if found {
-        info!(agent = body.agent_id, "IPC agent revoked");
+        info!(
+            agent = body.agent_id,
+            tokens_revoked = tokens_revoked,
+            "IPC agent revoked (token removed)"
+        );
     }
-    Ok(Json(serde_json::json!({ "ok": true, "found": found })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "found": found,
+        "tokens_revoked": tokens_revoked
+    })))
 }
 
 /// POST /admin/ipc/disable — disable an agent without revoking its token.
@@ -964,10 +1039,20 @@ pub async fn handle_admin_ipc_quarantine(
     let found = db.set_agent_status(&body.agent_id, "quarantined");
     // Force trust level to 4
     let _ = db.set_agent_trust_level(&body.agent_id, 4);
+    // Retroactively move unread messages into quarantine lane
+    let moved = db.quarantine_pending_messages(&body.agent_id);
     if found {
-        info!(agent = body.agent_id, "IPC agent quarantined");
+        info!(
+            agent = body.agent_id,
+            messages_quarantined = moved,
+            "IPC agent quarantined (pending messages moved to quarantine lane)"
+        );
     }
-    Ok(Json(serde_json::json!({ "ok": true, "found": found })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "found": found,
+        "messages_quarantined": moved
+    })))
 }
 
 /// POST /admin/ipc/downgrade — downgrade an agent's trust level (only increases).
@@ -1047,9 +1132,21 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn test_db() -> IpcDb {
         IpcDb::open_in_memory().expect("in-memory DB")
+    }
+
+    fn empty_l4() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    fn l4_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(alias, real)| (alias.to_string(), real.to_string()))
+            .collect()
     }
 
     // ── validate_send tests ─────────────────────────────────────
@@ -1057,14 +1154,14 @@ mod tests {
     #[test]
     fn validate_send_invalid_kind() {
         let db = test_db();
-        let result = validate_send(3, 1, "execute", "a", "b", None, &[], &[], &db);
+        let result = validate_send(3, 1, "execute", "a", "b", None, &[], &empty_l4(), &db);
         assert_eq!(result.unwrap_err().code, "invalid_kind");
     }
 
     #[test]
     fn validate_send_l4_text_only() {
         let db = test_db();
-        let l4_dests = vec!["opus".to_string()];
+        let l4_dests = l4_map(&[("supervisor", "opus")]);
         let result = validate_send(4, 1, "task", "kids", "opus", None, &[], &l4_dests, &db);
         assert_eq!(result.unwrap_err().code, "l4_text_only");
     }
@@ -1072,7 +1169,7 @@ mod tests {
     #[test]
     fn validate_send_l4_text_allowed() {
         let db = test_db();
-        let l4_dests = vec!["opus".to_string()];
+        let l4_dests = l4_map(&[("supervisor", "opus")]);
         let result = validate_send(4, 1, "text", "kids", "opus", None, &[], &l4_dests, &db);
         assert!(result.is_ok());
     }
@@ -1080,28 +1177,28 @@ mod tests {
     #[test]
     fn validate_send_l4_destination_denied() {
         let db = test_db();
-        let result = validate_send(4, 1, "text", "kids", "opus", None, &[], &[], &db);
+        let result = validate_send(4, 1, "text", "kids", "opus", None, &[], &empty_l4(), &db);
         assert_eq!(result.unwrap_err().code, "l4_destination_denied");
     }
 
     #[test]
     fn validate_send_task_upward_denied() {
         let db = test_db();
-        let result = validate_send(3, 1, "task", "worker", "opus", None, &[], &[], &db);
+        let result = validate_send(3, 1, "task", "worker", "opus", None, &[], &empty_l4(), &db);
         assert_eq!(result.unwrap_err().code, "task_upward_denied");
     }
 
     #[test]
     fn validate_send_task_lateral_denied() {
         let db = test_db();
-        let result = validate_send(2, 2, "task", "a", "b", None, &[], &[], &db);
+        let result = validate_send(2, 2, "task", "a", "b", None, &[], &empty_l4(), &db);
         assert_eq!(result.unwrap_err().code, "task_lateral_denied");
     }
 
     #[test]
     fn validate_send_task_downward_ok() {
         let db = test_db();
-        let result = validate_send(1, 3, "task", "opus", "worker", None, &[], &[], &db);
+        let result = validate_send(1, 3, "task", "opus", "worker", None, &[], &empty_l4(), &db);
         assert!(result.is_ok());
     }
 
@@ -1116,7 +1213,7 @@ mod tests {
             "opus",
             Some("session-1"),
             &[],
-            &[],
+            &empty_l4(),
             &db,
         );
         assert_eq!(result.unwrap_err().code, "result_no_task");
@@ -1125,14 +1222,24 @@ mod tests {
     #[test]
     fn validate_send_result_without_session() {
         let db = test_db();
-        let result = validate_send(3, 1, "result", "worker", "opus", None, &[], &[], &db);
+        let result = validate_send(
+            3,
+            1,
+            "result",
+            "worker",
+            "opus",
+            None,
+            &[],
+            &empty_l4(),
+            &db,
+        );
         assert_eq!(result.unwrap_err().code, "result_no_task");
     }
 
     #[test]
     fn validate_send_l4_lateral_denied() {
         let db = test_db();
-        let l4_dests = vec!["other_kid".to_string()];
+        let l4_dests = l4_map(&[("peer", "other_kid")]);
         let result = validate_send(4, 4, "text", "kids", "other_kid", None, &[], &l4_dests, &db);
         assert_eq!(result.unwrap_err().code, "l4_lateral_denied");
     }
@@ -1140,7 +1247,17 @@ mod tests {
     #[test]
     fn validate_send_l3_lateral_text_denied() {
         let db = test_db();
-        let result = validate_send(3, 3, "text", "agent_a", "agent_b", None, &[], &[], &db);
+        let result = validate_send(
+            3,
+            3,
+            "text",
+            "agent_a",
+            "agent_b",
+            None,
+            &[],
+            &empty_l4(),
+            &db,
+        );
         assert_eq!(result.unwrap_err().code, "l3_lateral_denied");
     }
 
@@ -1148,7 +1265,17 @@ mod tests {
     fn validate_send_l3_lateral_text_allowed() {
         let db = test_db();
         let pairs = vec![["agent_a".to_string(), "agent_b".to_string()]];
-        let result = validate_send(3, 3, "text", "agent_a", "agent_b", None, &pairs, &[], &db);
+        let result = validate_send(
+            3,
+            3,
+            "text",
+            "agent_a",
+            "agent_b",
+            None,
+            &pairs,
+            &empty_l4(),
+            &db,
+        );
         assert!(result.is_ok());
     }
 
@@ -1156,7 +1283,17 @@ mod tests {
     fn validate_send_l3_lateral_text_reverse() {
         let db = test_db();
         let pairs = vec![["agent_b".to_string(), "agent_a".to_string()]];
-        let result = validate_send(3, 3, "text", "agent_a", "agent_b", None, &pairs, &[], &db);
+        let result = validate_send(
+            3,
+            3,
+            "text",
+            "agent_a",
+            "agent_b",
+            None,
+            &pairs,
+            &empty_l4(),
+            &db,
+        );
         assert!(result.is_ok());
     }
 
@@ -1575,7 +1712,7 @@ mod tests {
             "research",
             Some("s1"),
             &[],
-            &[],
+            &empty_l4(),
             &db,
         );
         assert!(result.is_ok());

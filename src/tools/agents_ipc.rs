@@ -158,7 +158,7 @@ impl Tool for AgentsSendTool {
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["text", "task", "result", "query", "notify"],
+                    "enum": ["text", "task", "result", "query"],
                     "description": "Message kind (default: text)"
                 },
                 "payload": {
