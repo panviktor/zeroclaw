@@ -14,10 +14,12 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, due_jobs, get_job, list_jobs, list_runs, record_last_run, record_run,
-    remove_job, reschedule_after_run, update_job,
+    add_agent_job, add_agent_job_full, due_jobs, get_job, list_jobs, list_runs, record_last_run,
+    record_run, remove_job, reschedule_after_run, update_job,
 };
-pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
+pub use types::{
+    CronJob, CronJobPatch, CronRun, DeliveryConfig, ExecutionMode, JobType, Schedule, SessionTarget,
+};
 
 /// Validate a shell command against the full security policy (allowlist + risk gate).
 ///

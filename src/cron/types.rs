@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -7,6 +8,19 @@ pub enum JobType {
     #[default]
     Shell,
     Agent,
+}
+
+/// How an agent job is executed by the scheduler.
+///
+/// - `InProcess`: runs via `crate::agent::run()` in the scheduler's process (legacy default).
+/// - `Subprocess`: launches `zeroclaw agent -m "…"` as a separate OS process with its own PID,
+///   environment, and (eventually) sandbox wrapping.  Required for Phase 3A ephemeral agents.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    #[default]
+    InProcess,
+    Subprocess,
 }
 
 impl From<JobType> for &'static str {
@@ -115,6 +129,11 @@ pub struct CronJob {
     pub enabled: bool,
     pub delivery: DeliveryConfig,
     pub delete_after_run: bool,
+    pub execution_mode: ExecutionMode,
+    /// Extra environment variables passed to the child process in `Subprocess` mode.
+    /// Ignored for `InProcess` mode.
+    #[serde(default)]
+    pub env_overlay: HashMap<String, String>,
     pub created_at: DateTime<Utc>,
     pub next_run: DateTime<Utc>,
     pub last_run: Option<DateTime<Utc>>,
@@ -148,7 +167,7 @@ pub struct CronJobPatch {
 
 #[cfg(test)]
 mod tests {
-    use super::JobType;
+    use super::{ExecutionMode, JobType};
 
     #[test]
     fn job_type_try_from_accepts_known_values_case_insensitive() {
@@ -162,5 +181,20 @@ mod tests {
     fn job_type_try_from_rejects_invalid_values() {
         assert!(JobType::try_from("").is_err());
         assert!(JobType::try_from("unknown").is_err());
+    }
+
+    #[test]
+    fn execution_mode_defaults_to_in_process() {
+        assert_eq!(ExecutionMode::default(), ExecutionMode::InProcess);
+    }
+
+    #[test]
+    fn execution_mode_serde_roundtrip() {
+        let modes = [ExecutionMode::InProcess, ExecutionMode::Subprocess];
+        for mode in modes {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: ExecutionMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
+        }
     }
 }

@@ -2753,7 +2753,11 @@ mod tests {
         // Original L4 message is still in quarantine (quarantine fetch
         // does NOT mark as read, so it persists)
         let q2 = db.fetch_inbox("opus", true, 50);
-        assert_eq!(q2.len(), 1, "original quarantine message should still be there");
+        assert_eq!(
+            q2.len(),
+            1,
+            "original quarantine message should still be there"
+        );
         assert_ne!(q2[0].kind, PROMOTED_KIND);
     }
 
@@ -2891,7 +2895,10 @@ mod tests {
             0,
             None,
         );
-        assert!(result.is_ok(), "promote after quarantine review must succeed");
+        assert!(
+            result.is_ok(),
+            "promote after quarantine review must succeed"
+        );
     }
 
     #[test]
