@@ -405,6 +405,17 @@ impl IpcDb {
         .unwrap_or(0)
     }
 
+    /// Count messages in a session (for session length limits).
+    pub fn session_message_count(&self, session_id: &str) -> i64 {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND blocked = 0",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+
     /// Block pending messages for an agent (used by revoke/disable).
     pub fn block_pending_messages(&self, agent_id: &str, reason: &str) {
         let conn = self.conn.lock();
@@ -527,6 +538,10 @@ pub struct AdminDowngradeBody {
 
 /// Allowed message kinds.
 const VALID_KINDS: &[&str] = &["text", "task", "result", "query"];
+
+/// Internal-only message kind for system-generated escalation notifications.
+/// Not in VALID_KINDS — cannot be sent by agents, only by broker logic.
+const ESCALATION_KIND: &str = "escalation";
 
 /// Validate whether a send operation is permitted by the ACL rules.
 ///
@@ -1004,6 +1019,58 @@ pub async fn handle_ipc_send(
                     "retryable": false
                 })),
             ));
+        }
+    }
+
+    // Session length limit for lateral (same-level) exchanges
+    if meta.trust_level == to_level && meta.trust_level >= 2 {
+        if let Some(ref sid) = body.session_id {
+            let count = db.session_message_count(sid);
+            let config_lock = state.config.lock();
+            let max = config_lock.agents_ipc.session_max_exchanges;
+            let coordinator = config_lock.agents_ipc.coordinator_agent.clone();
+            let ttl = config_lock.agents_ipc.message_ttl_secs;
+            drop(config_lock);
+
+            if count >= i64::from(max) {
+                let escalation_payload = serde_json::json!({
+                    "type": "session_limit_exceeded",
+                    "session_id": sid,
+                    "participants": [&meta.agent_id, &resolved_to],
+                    "exchange_count": count,
+                    "max_allowed": max,
+                })
+                .to_string();
+
+                let _ = db.insert_message(
+                    &meta.agent_id,
+                    &coordinator,
+                    ESCALATION_KIND,
+                    &escalation_payload,
+                    meta.trust_level,
+                    Some(sid),
+                    0,
+                    ttl,
+                );
+
+                if let Some(ref logger) = state.audit_logger {
+                    let _ = logger.log(&AuditEvent::ipc(
+                        AuditEventType::IpcAdminAction,
+                        &meta.agent_id,
+                        Some(&coordinator),
+                        &format!("session_limit_exceeded: session={sid}, count={count}, max={max}"),
+                    ));
+                }
+
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": format!("Session exceeded {max} exchanges. Escalated to {coordinator}."),
+                        "code": "session_limit_exceeded",
+                        "retryable": false
+                    })),
+                ));
+            }
         }
     }
 
@@ -2200,5 +2267,41 @@ mod tests {
         // Next insert should detect seq <= last_seq in messages table
         let result = db.insert_message("a", "b", "text", "msg2", 3, None, 0, None);
         assert!(result.is_err(), "corruption must be detected");
+    }
+
+    // ── Session length limit tests ──────────────────────────────
+
+    #[test]
+    fn session_message_count_empty() {
+        let db = test_db();
+        assert_eq!(db.session_message_count("nonexistent"), 0);
+    }
+
+    #[test]
+    fn session_message_count_tracks() {
+        let db = test_db();
+        db.update_last_seen("a", 3, "worker");
+        db.update_last_seen("b", 3, "worker");
+        let sid = "session-123";
+        db.insert_message("a", "b", "text", "m1", 3, Some(sid), 0, None).unwrap();
+        db.insert_message("b", "a", "text", "m2", 3, Some(sid), 0, None).unwrap();
+        db.insert_message("a", "b", "text", "m3", 3, Some(sid), 0, None).unwrap();
+        assert_eq!(db.session_message_count(sid), 3);
+    }
+
+    #[test]
+    fn session_message_count_ignores_blocked() {
+        let db = test_db();
+        db.update_last_seen("a", 3, "worker");
+        db.update_last_seen("b", 3, "worker");
+        let sid = "session-456";
+        db.insert_message("a", "b", "text", "m1", 3, Some(sid), 0, None).unwrap();
+        db.block_pending_messages("b", "test");
+        assert_eq!(db.session_message_count(sid), 0);
+    }
+
+    #[test]
+    fn escalation_kind_not_in_valid_kinds() {
+        assert!(!VALID_KINDS.contains(&ESCALATION_KIND));
     }
 }

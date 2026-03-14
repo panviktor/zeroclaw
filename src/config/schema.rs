@@ -1314,6 +1314,16 @@ pub struct AgentsIpcConfig {
     /// PromptGuard configuration for IPC payload scanning.
     #[serde(default)]
     pub prompt_guard: IpcPromptGuardConfig,
+
+    /// Max messages per lateral session before auto-escalation (default: 10).
+    /// Only applies to same-level exchanges (L2-L2, L3-L3).
+    #[serde(default = "default_session_max_exchanges")]
+    pub session_max_exchanges: u32,
+
+    /// Agent ID of the coordinator that receives session escalation notifications.
+    /// Default: "opus".
+    #[serde(default = "default_coordinator_agent")]
+    pub coordinator_agent: String,
 }
 
 /// PromptGuard configuration for IPC message payload scanning.
@@ -1376,6 +1386,14 @@ fn default_ipc_request_timeout_secs() -> u64 {
     10
 }
 
+fn default_session_max_exchanges() -> u32 {
+    10
+}
+
+fn default_coordinator_agent() -> String {
+    "opus".into()
+}
+
 impl Default for AgentsIpcConfig {
     fn default() -> Self {
         Self {
@@ -1391,6 +1409,8 @@ impl Default for AgentsIpcConfig {
             lateral_text_pairs: Vec::new(),
             l4_destinations: HashMap::new(),
             prompt_guard: IpcPromptGuardConfig::default(),
+            session_max_exchanges: default_session_max_exchanges(),
+            coordinator_agent: default_coordinator_agent(),
         }
     }
 }
