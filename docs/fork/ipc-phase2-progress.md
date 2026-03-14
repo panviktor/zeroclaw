@@ -14,7 +14,7 @@ Execution owner: `Opus`
 | 2 | PromptGuard: broker payload scanning (block/warn only) | gateway/ipc.rs, config/schema.rs, gateway/mod.rs | DONE (2026-03-14) | 1 |
 | 3 | Structured output: trust_warning + quarantine label | gateway/ipc.rs, tools/agents_ipc.rs | DONE (2026-03-14) | — |
 | 4 | Credential leak scanning via LeakDetector (send + state_set) | gateway/ipc.rs, gateway/mod.rs | DONE (2026-03-14) | 1 |
-| 5 | Sequence integrity check | gateway/ipc.rs | TODO | — |
+| 5 | Sequence integrity check | gateway/ipc.rs | DONE (2026-03-14) | — |
 | 6 | Session length limits + provenance-preserving escalation | gateway/ipc.rs, config/schema.rs | TODO | 1 |
 | 7 | Promote-to-task: quarantine -> provenance-preserving envelope | gateway/ipc.rs, gateway/mod.rs | TODO | 1, 3 |
 | 8 | Final validation: fmt + clippy + test + docs | — | TODO | all |
@@ -28,4 +28,5 @@ Execution owner: `Opus`
 | 2026-03-14 | 1 | 1 | Audit trail: 7 event types, AuditEvent::ipc() builder, wired into all handlers. PR #26 |
 | 2026-03-14 | 1 | 2 | PromptGuard: IpcPromptGuardConfig, scan in handle_ipc_send, block/warn, exempt levels. PR #27 |
 | 2026-03-14 | 1 | 3 | Structured output: trust_warning + quarantine label in InboxMessage, tool description updated. PR #28 |
-| 2026-03-14 | 1 | 4 | LeakDetector: scan send + state_set, audit IpcLeakDetected, 4 tests. |
+| 2026-03-14 | 1 | 4 | LeakDetector: scan send + state_set, audit IpcLeakDetected, 4 tests. PR #29 |
+| 2026-03-14 | 1 | 5 | Sequence integrity: per-pair monotonicity check in insert_message, corruption detection, 3 tests. |
