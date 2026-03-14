@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::security::audit::{AuditEvent, AuditEventType};
 use tracing::{info, warn};
 
 // ── IpcDb (broker-owned SQLite) ─────────────────────────────────
@@ -805,6 +806,14 @@ pub async fn handle_ipc_send(
     // Per-agent send rate limiting
     if let Some(ref limiter) = state.ipc_rate_limiter {
         if !limiter.allow(&meta.agent_id) {
+            if let Some(ref logger) = state.audit_logger {
+                let _ = logger.log(&AuditEvent::ipc(
+                    AuditEventType::IpcRateLimited,
+                    &meta.agent_id,
+                    None,
+                    "send rate limit exceeded",
+                ));
+            }
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({
@@ -854,7 +863,7 @@ pub async fn handle_ipc_send(
         })?;
 
     // ACL check
-    validate_send(
+    if let Err(e) = validate_send(
         meta.trust_level,
         to_level,
         &body.kind,
@@ -864,8 +873,19 @@ pub async fn handle_ipc_send(
         &config.agents_ipc.lateral_text_pairs,
         &config.agents_ipc.l4_destinations,
         db,
-    )
-    .map_err(|e| e.into_response_pair(meta.trust_level))?;
+    ) {
+        if let Some(ref logger) = state.audit_logger {
+            let mut event = AuditEvent::ipc(
+                AuditEventType::IpcBlocked,
+                &meta.agent_id,
+                Some(&resolved_to),
+                &format!("acl_denied: kind={}, reason={}", body.kind, e.error),
+            );
+            if let Some(a) = event.action.as_mut() { a.allowed = false; }
+            let _ = logger.log(&event);
+        }
+        return Err(e.into_response_pair(meta.trust_level));
+    }
 
     let message_ttl = config.agents_ipc.message_ttl_secs;
     drop(config);
@@ -899,6 +919,15 @@ pub async fn handle_ipc_send(
         msg_id = msg_id,
         "IPC message sent"
     );
+
+    if let Some(ref logger) = state.audit_logger {
+        let _ = logger.log(&AuditEvent::ipc(
+            AuditEventType::IpcSend,
+            &meta.agent_id,
+            Some(&resolved_to),
+            &format!("kind={}, msg_id={}, session={:?}", body.kind, msg_id, body.session_id),
+        ));
+    }
 
     Ok(Json(serde_json::json!({ "ok": true, "id": msg_id })))
 }
@@ -969,6 +998,15 @@ pub async fn handle_ipc_state_set(
 
     info!(agent = meta.agent_id, key = body.key, "IPC state set");
 
+    if let Some(ref logger) = state.audit_logger {
+        let _ = logger.log(&AuditEvent::ipc(
+            AuditEventType::IpcStateChange,
+            &meta.agent_id,
+            None,
+            &format!("state_set key={}", body.key),
+        ));
+    }
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1004,6 +1042,14 @@ pub async fn handle_admin_ipc_revoke(
             tokens_revoked = tokens_revoked,
             "IPC agent revoked (token removed)"
         );
+        if let Some(ref logger) = state.audit_logger {
+            let _ = logger.log(&AuditEvent::ipc(
+                AuditEventType::IpcAdminAction,
+                "admin",
+                Some(&body.agent_id),
+                &format!("revoke: tokens_revoked={tokens_revoked}"),
+            ));
+        }
     }
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -1024,6 +1070,14 @@ pub async fn handle_admin_ipc_disable(
     let found = db.set_agent_status(&body.agent_id, "disabled");
     if found {
         info!(agent = body.agent_id, "IPC agent disabled");
+        if let Some(ref logger) = state.audit_logger {
+            let _ = logger.log(&AuditEvent::ipc(
+                AuditEventType::IpcAdminAction,
+                "admin",
+                Some(&body.agent_id),
+                "disable",
+            ));
+        }
     }
     Ok(Json(serde_json::json!({ "ok": true, "found": found })))
 }
@@ -1047,6 +1101,14 @@ pub async fn handle_admin_ipc_quarantine(
             messages_quarantined = moved,
             "IPC agent quarantined (pending messages moved to quarantine lane)"
         );
+        if let Some(ref logger) = state.audit_logger {
+            let _ = logger.log(&AuditEvent::ipc(
+                AuditEventType::IpcAdminAction,
+                "admin",
+                Some(&body.agent_id),
+                &format!("quarantine: messages_moved={moved}"),
+            ));
+        }
     }
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -1071,6 +1133,14 @@ pub async fn handle_admin_ipc_downgrade(
                 new_level = body.new_level,
                 "IPC agent downgraded"
             );
+            if let Some(ref logger) = state.audit_logger {
+                let _ = logger.log(&AuditEvent::ipc(
+                    AuditEventType::IpcAdminAction,
+                    "admin",
+                    Some(&body.agent_id),
+                    &format!("downgrade: {} -> {}", old_level, body.new_level),
+                ));
+            }
             Ok(Json(serde_json::json!({
                 "ok": true,
                 "old_level": old_level,
@@ -1752,5 +1822,53 @@ mod tests {
         // Fetch should clean up expired messages
         let messages = db.fetch_inbox("worker", true, 50);
         assert!(messages.is_empty());
+    }
+
+    // ── AuditEvent::ipc builder tests ───────────────────────────
+
+    #[test]
+    fn audit_ipc_with_to_agent() {
+        let event = AuditEvent::ipc(
+            AuditEventType::IpcSend,
+            "opus",
+            Some("research"),
+            "kind=task, msg_id=42",
+        );
+        let action = event.action.as_ref().unwrap();
+        let cmd = action.command.as_ref().unwrap();
+        assert!(cmd.contains("from=opus"), "command should contain from");
+        assert!(cmd.contains("to=research"), "command should contain to");
+        assert!(cmd.contains("kind=task"), "command should contain detail");
+        assert!(action.allowed);
+
+        let actor = event.actor.as_ref().unwrap();
+        assert_eq!(actor.channel, "ipc");
+        assert_eq!(actor.user_id, Some("opus".to_string()));
+    }
+
+    #[test]
+    fn audit_ipc_without_to_agent() {
+        let event = AuditEvent::ipc(
+            AuditEventType::IpcRateLimited,
+            "kids",
+            None,
+            "send rate limit exceeded",
+        );
+        let cmd = event.action.as_ref().unwrap().command.as_ref().unwrap();
+        assert!(cmd.contains("from=kids"));
+        assert!(!cmd.contains("to="));
+        assert!(cmd.contains("send rate limit exceeded"));
+    }
+
+    #[test]
+    fn audit_ipc_blocked_event() {
+        let mut event = AuditEvent::ipc(
+            AuditEventType::IpcBlocked,
+            "kids",
+            Some("opus"),
+            "acl_denied: kind=task",
+        );
+        if let Some(a) = event.action.as_mut() { a.allowed = false; }
+        assert!(!event.action.as_ref().unwrap().allowed);
     }
 }
