@@ -7,6 +7,8 @@
 use super::{require_localhost, AppState};
 use crate::config::TokenMetadata;
 use crate::gateway::api::extract_bearer_token;
+use crate::security::audit::{AuditEvent, AuditEventType};
+use crate::security::{GuardResult, LeakResult};
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
@@ -20,8 +22,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::security::audit::{AuditEvent, AuditEventType};
-use crate::security::{GuardResult, LeakResult};
 use tracing::{info, warn};
 
 // ── IpcDb (broker-owned SQLite) ─────────────────────────────────
@@ -102,7 +102,18 @@ impl IpcDb {
                 last_seq INTEGER NOT NULL DEFAULT 0
             );
             ",
-        )
+        )?;
+
+        // Idempotent migration: add `promoted` column if missing (Phase 2).
+        let has_promoted: bool = conn
+            .prepare("PRAGMA table_info(messages)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.as_deref() == Ok("promoted"));
+        if !has_promoted {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN promoted INTEGER DEFAULT 0;")?;
+        }
+
+        Ok(())
     }
 
     /// Upsert agent record and update `last_seen` timestamp.
@@ -244,20 +255,22 @@ impl IpcDb {
             "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?1",
             params![now],
         );
-        // quarantine=false: normal inbox (from_trust_level < 4)
-        // quarantine=true: quarantine review lane (ONLY from_trust_level >= 4)
+        // quarantine=false: normal inbox — from_trust_level < 4 OR promoted = 1
+        // quarantine=true: quarantine review lane — from_trust_level >= 4 AND NOT promoted
         let query = if include_quarantine {
             "SELECT id, session_id, from_agent, to_agent, kind, payload, priority,
                     from_trust_level, seq, created_at
              FROM messages
-             WHERE to_agent = ?1 AND read = 0 AND blocked = 0 AND from_trust_level >= 4
+             WHERE to_agent = ?1 AND read = 0 AND blocked = 0
+               AND from_trust_level >= 4 AND promoted = 0
              ORDER BY priority DESC, created_at ASC
              LIMIT ?2"
         } else {
             "SELECT id, session_id, from_agent, to_agent, kind, payload, priority,
                     from_trust_level, seq, created_at
              FROM messages
-             WHERE to_agent = ?1 AND read = 0 AND blocked = 0 AND from_trust_level < 4
+             WHERE to_agent = ?1 AND read = 0 AND blocked = 0
+               AND (from_trust_level < 4 OR promoted = 1)
              ORDER BY priority DESC, created_at ASC
              LIMIT ?2"
         };
@@ -425,9 +438,86 @@ impl IpcDb {
             params![agent_id, reason],
         );
     }
+
+    /// Fetch a single message by ID (for promote-to-task).
+    pub fn get_message(&self, id: i64) -> Option<StoredMessage> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id, session_id, from_agent, to_agent, kind, payload,
+                    priority, from_trust_level, seq, created_at
+             FROM messages WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    from_agent: row.get(2)?,
+                    to_agent: row.get(3)?,
+                    kind: row.get(4)?,
+                    payload: row.get(5)?,
+                    priority: row.get(6)?,
+                    from_trust_level: row.get(7)?,
+                    seq: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// Insert a promoted message (escapes quarantine lane via promoted=1).
+    pub fn insert_promoted_message(
+        &self,
+        from_agent: &str,
+        to_agent: &str,
+        kind: &str,
+        payload: &str,
+        from_trust_level: u8,
+        session_id: Option<&str>,
+        priority: i32,
+        message_ttl_secs: Option<u64>,
+    ) -> Result<i64, rusqlite::Error> {
+        let now = unix_now();
+        let seq = self.next_seq(from_agent);
+        let expires_at = message_ttl_secs.map(|ttl| now + ttl as i64);
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO messages (session_id, from_agent, to_agent, kind, payload,
+             priority, from_trust_level, seq, created_at, expires_at, promoted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
+            params![
+                session_id,
+                from_agent,
+                to_agent,
+                kind,
+                payload,
+                priority,
+                from_trust_level,
+                seq,
+                now,
+                expires_at
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
 }
 
 // ── Request/Response types ──────────────────────────────────────
+
+/// A stored message fetched by ID (for promote-to-task).
+#[derive(Debug)]
+pub struct StoredMessage {
+    pub id: i64,
+    pub session_id: Option<String>,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub kind: String,
+    pub payload: String,
+    pub priority: i32,
+    pub from_trust_level: u8,
+    pub seq: i64,
+    pub created_at: i64,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SendBody {
@@ -534,6 +624,12 @@ pub struct AdminDowngradeBody {
     pub new_level: u8,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PromoteBody {
+    pub message_id: i64,
+    pub to_agent: String,
+}
+
 // ── ACL validation ──────────────────────────────────────────────
 
 /// Allowed message kinds.
@@ -542,6 +638,9 @@ const VALID_KINDS: &[&str] = &["text", "task", "result", "query"];
 /// Internal-only message kind for system-generated escalation notifications.
 /// Not in VALID_KINDS — cannot be sent by agents, only by broker logic.
 const ESCALATION_KIND: &str = "escalation";
+
+/// Internal-only message kind for quarantine content promoted by admin.
+const PROMOTED_KIND: &str = "promoted_quarantine";
 
 /// Validate whether a send operation is permitted by the ACL rules.
 ///
@@ -946,7 +1045,9 @@ pub async fn handle_ipc_send(
                 Some(&resolved_to),
                 &format!("acl_denied: kind={}, reason={}", body.kind, e.error),
             );
-            if let Some(a) = event.action.as_mut() { a.allowed = false; }
+            if let Some(a) = event.action.as_mut() {
+                a.allowed = false;
+            }
             let _ = logger.log(&event);
         }
         return Err(e.into_response_pair(meta.trust_level));
@@ -1109,7 +1210,10 @@ pub async fn handle_ipc_send(
             AuditEventType::IpcSend,
             &meta.agent_id,
             Some(&resolved_to),
-            &format!("kind={}, msg_id={}, session={:?}", body.kind, msg_id, body.session_id),
+            &format!(
+                "kind={}, msg_id={}, session={:?}",
+                body.kind, msg_id, body.session_id
+            ),
         ));
     }
 
@@ -1195,7 +1299,10 @@ pub async fn handle_ipc_state_set(
                     AuditEventType::IpcLeakDetected,
                     &meta.agent_id,
                     None,
-                    &format!("credential_leak in state_set key={}: {patterns:?}", body.key),
+                    &format!(
+                        "credential_leak in state_set key={}: {patterns:?}",
+                        body.key
+                    ),
                 ));
             }
             return Err((
@@ -1370,6 +1477,104 @@ pub async fn handle_admin_ipc_downgrade(
             })),
         )),
     }
+}
+
+/// POST /admin/ipc/promote — promote a quarantine message to the normal inbox.
+pub async fn handle_admin_ipc_promote(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<PromoteBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+
+    let msg = db.get_message(body.message_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Message not found",
+                "code": "not_found"
+            })),
+        )
+    })?;
+
+    if msg.from_trust_level < 4 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Only quarantine messages can be promoted",
+                "code": "not_quarantine"
+            })),
+        ));
+    }
+
+    let promoted_payload = serde_json::json!({
+        "type": "promoted_quarantine",
+        "original": {
+            "message_id": msg.id,
+            "from_agent": msg.from_agent,
+            "from_trust_level": msg.from_trust_level,
+            "original_kind": msg.kind,
+            "payload": msg.payload,
+            "created_at": msg.created_at,
+        },
+        "promoted_by": "admin",
+        "promoted_at": unix_now(),
+    })
+    .to_string();
+
+    let ttl = state.config.lock().agents_ipc.message_ttl_secs;
+
+    let new_id = db
+        .insert_promoted_message(
+            &msg.from_agent,
+            &body.to_agent,
+            PROMOTED_KIND,
+            &promoted_payload,
+            msg.from_trust_level,
+            msg.session_id.as_deref(),
+            0,
+            ttl,
+        )
+        .map_err(|e| {
+            warn!(error = %e, "Failed to insert promoted message");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to promote message",
+                    "code": "db_error"
+                })),
+            )
+        })?;
+
+    info!(
+        original_id = msg.id,
+        new_id = new_id,
+        from = msg.from_agent,
+        to = body.to_agent,
+        "Quarantine message promoted"
+    );
+
+    if let Some(ref logger) = state.audit_logger {
+        let _ = logger.log(&AuditEvent::ipc(
+            AuditEventType::IpcAdminAction,
+            "admin",
+            Some(&body.to_agent),
+            &format!(
+                "promote: quarantine msg_id={} from={} (L{}) -> promoted_quarantine to={} msg_id={}",
+                msg.id, msg.from_agent, msg.from_trust_level, body.to_agent, new_id
+            ),
+        ));
+    }
+
+    Ok(Json(serde_json::json!({
+        "promoted": true,
+        "original_message_id": msg.id,
+        "new_message_id": new_id,
+        "from_agent": msg.from_agent,
+        "to_agent": body.to_agent,
+        "original_trust_level": msg.from_trust_level,
+    })))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -2083,7 +2288,9 @@ mod tests {
             Some("opus"),
             "acl_denied: kind=task",
         );
-        if let Some(a) = event.action.as_mut() { a.allowed = false; }
+        if let Some(a) = event.action.as_mut() {
+            a.allowed = false;
+        }
         assert!(!event.action.as_ref().unwrap().allowed);
     }
 
@@ -2187,7 +2394,11 @@ mod tests {
             m.quarantined = Some(true);
         }
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].trust_warning.as_ref().unwrap().starts_with("QUARANTINE"));
+        assert!(messages[0]
+            .trust_warning
+            .as_ref()
+            .unwrap()
+            .starts_with("QUARANTINE"));
         assert_eq!(messages[0].quarantined, Some(true));
     }
 
@@ -2243,9 +2454,15 @@ mod tests {
         db.update_last_seen("b", 3, "worker");
         db.update_last_seen("c", 3, "worker");
         // a→b and a→c use the same sender seq counter but different pair checks
-        assert!(db.insert_message("a", "b", "text", "msg1", 3, None, 0, None).is_ok());
-        assert!(db.insert_message("a", "c", "text", "msg2", 3, None, 0, None).is_ok());
-        assert!(db.insert_message("a", "b", "text", "msg3", 3, None, 0, None).is_ok());
+        assert!(db
+            .insert_message("a", "b", "text", "msg1", 3, None, 0, None)
+            .is_ok());
+        assert!(db
+            .insert_message("a", "c", "text", "msg2", 3, None, 0, None)
+            .is_ok());
+        assert!(db
+            .insert_message("a", "b", "text", "msg3", 3, None, 0, None)
+            .is_ok());
     }
 
     #[test]
@@ -2254,7 +2471,8 @@ mod tests {
         db.update_last_seen("a", 3, "worker");
         db.update_last_seen("b", 3, "worker");
         // Insert normally
-        db.insert_message("a", "b", "text", "msg1", 3, None, 0, None).unwrap();
+        db.insert_message("a", "b", "text", "msg1", 3, None, 0, None)
+            .unwrap();
         // Manually corrupt: set message_sequences back so next_seq returns a lower value
         {
             let conn = db.conn.lock();
@@ -2283,9 +2501,12 @@ mod tests {
         db.update_last_seen("a", 3, "worker");
         db.update_last_seen("b", 3, "worker");
         let sid = "session-123";
-        db.insert_message("a", "b", "text", "m1", 3, Some(sid), 0, None).unwrap();
-        db.insert_message("b", "a", "text", "m2", 3, Some(sid), 0, None).unwrap();
-        db.insert_message("a", "b", "text", "m3", 3, Some(sid), 0, None).unwrap();
+        db.insert_message("a", "b", "text", "m1", 3, Some(sid), 0, None)
+            .unwrap();
+        db.insert_message("b", "a", "text", "m2", 3, Some(sid), 0, None)
+            .unwrap();
+        db.insert_message("a", "b", "text", "m3", 3, Some(sid), 0, None)
+            .unwrap();
         assert_eq!(db.session_message_count(sid), 3);
     }
 
@@ -2295,7 +2516,8 @@ mod tests {
         db.update_last_seen("a", 3, "worker");
         db.update_last_seen("b", 3, "worker");
         let sid = "session-456";
-        db.insert_message("a", "b", "text", "m1", 3, Some(sid), 0, None).unwrap();
+        db.insert_message("a", "b", "text", "m1", 3, Some(sid), 0, None)
+            .unwrap();
         db.block_pending_messages("b", "test");
         assert_eq!(db.session_message_count(sid), 0);
     }
@@ -2303,5 +2525,90 @@ mod tests {
     #[test]
     fn escalation_kind_not_in_valid_kinds() {
         assert!(!VALID_KINDS.contains(&ESCALATION_KIND));
+    }
+
+    #[test]
+    fn promoted_kind_not_in_valid_kinds() {
+        assert!(!VALID_KINDS.contains(&PROMOTED_KIND));
+    }
+
+    // ── Promote-to-task tests ───────────────────────────────────
+
+    #[test]
+    fn get_message_returns_stored() {
+        let db = test_db();
+        db.update_last_seen("kids", 4, "restricted");
+        db.update_last_seen("opus", 1, "coordinator");
+        let id = db
+            .insert_message("kids", "opus", "text", "hello", 4, None, 0, None)
+            .unwrap();
+        let msg = db.get_message(id).unwrap();
+        assert_eq!(msg.from_agent, "kids");
+        assert_eq!(msg.from_trust_level, 4);
+        assert_eq!(msg.payload, "hello");
+    }
+
+    #[test]
+    fn get_message_not_found() {
+        let db = test_db();
+        assert!(db.get_message(99999).is_none());
+    }
+
+    #[test]
+    fn promoted_message_escapes_quarantine() {
+        let db = test_db();
+        db.update_last_seen("kids", 4, "restricted");
+        db.update_last_seen("opus", 1, "coordinator");
+
+        // Insert normal L4 message → goes to quarantine
+        db.insert_message("kids", "opus", "text", "help me", 4, None, 0, None)
+            .unwrap();
+        let q = db.fetch_inbox("opus", true, 50);
+        assert_eq!(q.len(), 1, "L4 message should be in quarantine");
+        let normal = db.fetch_inbox("opus", false, 50);
+        assert_eq!(normal.len(), 0, "L4 message should NOT be in normal inbox");
+
+        // Insert promoted message
+        db.insert_promoted_message(
+            "kids",
+            "opus",
+            PROMOTED_KIND,
+            "promoted content",
+            4,
+            None,
+            0,
+            None,
+        )
+        .unwrap();
+
+        // Promoted message appears in normal inbox, NOT quarantine
+        let normal2 = db.fetch_inbox("opus", false, 50);
+        assert_eq!(
+            normal2.len(),
+            1,
+            "promoted message should appear in normal inbox"
+        );
+        assert_eq!(normal2[0].kind, PROMOTED_KIND);
+
+        // Quarantine still has original (unread L4), not the promoted one
+        // (first fetch marked previous quarantine message as read, so re-insert)
+        db.insert_message("kids", "opus", "text", "another", 4, None, 0, None)
+            .unwrap();
+        let q2 = db.fetch_inbox("opus", true, 50);
+        assert_eq!(q2.len(), 1);
+        assert_ne!(q2[0].kind, PROMOTED_KIND);
+    }
+
+    #[test]
+    fn promoted_message_preserves_trust_level() {
+        let db = test_db();
+        db.update_last_seen("kids", 4, "restricted");
+        db.update_last_seen("opus", 1, "coordinator");
+        db.insert_promoted_message("kids", "opus", PROMOTED_KIND, "payload", 4, None, 0, None)
+            .unwrap();
+        let msgs = db.fetch_inbox("opus", false, 50);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].from_trust_level, 4, "trust level must be preserved");
+        assert_eq!(msgs[0].from_agent, "kids", "from_agent must be preserved");
     }
 }

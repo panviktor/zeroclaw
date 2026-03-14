@@ -35,6 +35,17 @@ lateral_text_pairs = [
 [agents_ipc.l4_destinations]
 supervisor = "opus"
 escalation = "sentinel"
+
+# Phase 2: session limits
+session_max_exchanges = 10
+coordinator_agent = "opus"
+
+# Phase 2: PromptGuard payload scanning
+[agents_ipc.prompt_guard]
+enabled = true
+action = "block"
+sensitivity = 0.55
+exempt_levels = [0, 1]
 ```
 
 > **Note**: The broker itself does not need `broker_url` or `broker_token` — it *is* the broker. These fields are only for agent instances that connect to the broker.
@@ -217,6 +228,11 @@ curl -sS -X POST "$BROKER/admin/ipc/revoke" \
 curl -sS -X POST "$BROKER/admin/ipc/downgrade" \
   -H 'Content-Type: application/json' \
   -d '{"agent_id": "code", "new_level": 3}'
+
+# Promote a quarantine message to normal inbox (Phase 2)
+curl -sS -X POST "$BROKER/admin/ipc/promote" \
+  -H 'Content-Type: application/json' \
+  -d '{"message_id": 42, "to_agent": "opus"}'
 ```
 
 ---

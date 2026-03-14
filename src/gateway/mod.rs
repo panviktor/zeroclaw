@@ -670,8 +670,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // PromptGuard for IPC payload scanning
     let ipc_prompt_guard = if config.agents_ipc.enabled && config.agents_ipc.prompt_guard.enabled {
-        let action =
-            crate::security::GuardAction::from_str(&config.agents_ipc.prompt_guard.action);
+        let action = crate::security::GuardAction::from_str(&config.agents_ipc.prompt_guard.action);
         Some(crate::security::PromptGuard::with_config(
             action,
             config.agents_ipc.prompt_guard.sensitivity,
@@ -776,6 +775,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/admin/ipc/downgrade",
             post(ipc::handle_admin_ipc_downgrade),
         )
+        .route("/admin/ipc/promote", post(ipc::handle_admin_ipc_promote))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
@@ -2739,10 +2739,13 @@ mod tests {
             HeaderValue::from_str(invalid_signature).unwrap(),
         );
 
-        let response =
-            Box::pin(handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body)))
-                .await
-                .into_response();
+        let response = Box::pin(handle_nextcloud_talk_webhook(
+            State(state),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
