@@ -33,7 +33,9 @@ Phase 3A ships first. Phase 3B is only valuable after 3A works.
 
 ### AD-1: Spawn control plane — agent-local runtime + broker-issued identity
 
-Child processes run **on the parent's host**, launched by the parent's local scheduler (`cron::add_agent_job`). The broker's role is limited to **identity provisioning and lifecycle management** — it issues ephemeral tokens, tracks session state, and handles revocation. The broker does not launch processes.
+Child processes run **on the parent's host** as **separate OS processes**, launched by the parent's local scheduler. The broker's role is limited to **identity provisioning and lifecycle management** — it issues ephemeral tokens, tracks session state, and handles revocation. The broker does not launch processes.
+
+**Breaking change from current scheduler**: the current `cron` scheduler runs agent jobs **in-process** via `crate::agent::run(config.clone(), ...)` (`scheduler.rs:175`). This means the child shares the parent's process, memory, and security context — it is not a "separate actor" in any meaningful sense. Phase 3A requires the scheduler to gain a **subprocess execution path**: `std::process::Command` / `tokio::process::Command` that launches `zeroclaw agent -m "..."` (or a dedicated `zeroclaw ephemeral` subcommand) as a separate OS process with its own PID, environment, and sandbox wrapping. The in-process path remains as legacy for `wait=false` fire-and-forget jobs without broker identity.
 
 **Why**: `agents_spawn` is already a local tool on top of `cron` (`agents_ipc.rs:692`). The distributed model from Phase 1 (`ipc-plan.md:15`) has agents on different hosts connecting to a shared broker. Broker-side compute would force all children onto the broker host, breaking this model. Instead:
 
@@ -66,6 +68,15 @@ For trust levels L2-L4, spawn **refuses to start** if the required sandbox backe
 5. Fallback is only allowed toward **stricter** isolation (e.g. Docker instead of Bubblewrap), never toward weaker
 
 **Why**: current `detect_best_sandbox()` (`detect.rs:67`) silently falls back to `NoopSandbox` when no backend is available. With that behavior, "trust level = real runtime boundary" would be a lie. Phase 3A adds `require_sandbox_for_profile()` that returns `Err` instead of falling back to noop.
+
+**Target platform**: Phase 3A sandbox enforcement targets **Linux hosts**. Landlock requires Linux 5.13+, Bubblewrap requires Linux user namespaces. On non-Linux platforms (macOS, Windows), only Docker backend is available for L2-L4 isolation. If Docker is also unavailable, L2-L4 spawn is denied. L0-L1 works everywhere (NoopSandbox allowed). This is an intentional operational constraint — the family multi-agent system runs on Linux servers.
+
+| Platform | L0-L1 | L2 | L3 | L4 |
+|----------|-------|----|----|----|
+| Linux 5.13+ | Noop/any | Landlock | Landlock + Bubblewrap | Bubblewrap or Docker |
+| Linux < 5.13 | Noop/any | Docker only | Docker only | Docker only |
+| macOS | Noop/any | Docker only | Docker only | Docker only |
+| Windows | Noop/any | Docker only | Docker only | Docker only |
 
 ### AD-3: Execution profile = trust-derived + workload overlay
 
@@ -397,9 +408,30 @@ All terminal states: token removed from runtime `paired_tokens`, future requests
 
 The agent knows nothing about Unix users, sandbox backends, or signing keys. Those are implementation details under `agents_spawn`.
 
+**Broker requirement**: `wait=true` and ephemeral identity provisioning require `broker_url` + `broker_token` in the agent's config (broker-backed mode). Without broker connectivity, `agents_spawn` falls back to the legacy fire-and-forget local path (`wait=false` only, no ephemeral identity, no result delivery, no auto-revoke). The quickstart doc (`ipc-quickstart.md`) describes `agents_spawn` as a local operation — this remains true for the legacy path, but the Phase 3A workflow requires broker-backed mode.
+
 ---
 
 ## Phase 3A: Implementation Steps
+
+### Step 0: Subprocess execution path in scheduler
+
+**Files**: `src/cron/scheduler.rs`, `src/cron/store.rs`
+
+**Prerequisite for all other steps.** The current scheduler runs agent jobs in-process via `crate::agent::run(config.clone(), ...)` (`scheduler.rs:175`). This must be extended with a subprocess path for broker-backed ephemeral agents.
+
+- Add `ExecutionMode` enum to `CronJob`: `InProcess` (current default) | `Subprocess`
+- `Subprocess` mode: launch child via `tokio::process::Command`:
+  - Binary: `zeroclaw agent -m "{prompt}"` (or dedicated `zeroclaw ephemeral` subcommand)
+  - Env vars from `env_overlay` (ZEROCLAW_BROKER_TOKEN, ZEROCLAW_AGENT_ID, etc.)
+  - Sandbox wrapping via `sandbox.wrap_command()` (existing `Sandbox` trait)
+  - Working directory: workspace-only for L3+
+  - Timeout: kill child process on expiry
+  - Capture exit code + stdout for audit
+- `InProcess` mode: unchanged, used for legacy `wait=false` jobs without broker identity
+- `add_agent_job()` extended with `execution_mode` and `env_overlay` parameters
+
+This is the foundation that makes "child = separate actor" a real OS-level guarantee.
 
 ### Step 1: Ephemeral identity provisioning
 

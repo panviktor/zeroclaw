@@ -14,12 +14,13 @@ This directory contains the strategy, plans, and operational docs for the ZeroCl
 | [ipc-phase2-plan.md](ipc-phase2-plan.md) | Phase 2: Hardened Security — PromptGuard, structured output, audit, replay, session limits | Everyone |
 | [ipc-phase2-progress.md](ipc-phase2-progress.md) | Phase 2 execution checklist (8 steps) | Opus |
 | [ipc-quickstart.md](ipc-quickstart.md) | Minimal configs, pairing flow, smoke-test curl commands | Everyone |
+| [ipc-phase3-plan.md](ipc-phase3-plan.md) | Phase 3: Trusted Execution — ephemeral agents, fail-closed sandbox, subprocess isolation, crypto provenance | Everyone |
 
 ## Reading order
 
 **New to the fork?** Start with `ipc-plan.md` → `sync-strategy.md` → `delta-registry.md`.
 
-**Starting IPC work?** Phase 1 is complete. For Phase 2, read `ipc-phase2-progress.md` → find the next TODO → read the matching section in `ipc-phase2-plan.md`.
+**Starting IPC work?** Phase 1 and 2 are complete. For Phase 3, read `ipc-phase3-plan.md` — start with Architectural Decisions (AD-1 through AD-6), then Implementation Steps.
 
 **Setting up IPC locally?** Follow `ipc-quickstart.md` — configs, pairing, smoke tests.
 
