@@ -31,4 +31,4 @@ Execution owner: `Opus`
 | 2026-03-14 | 1 | 4 | LeakDetector: scan send + state_set, audit IpcLeakDetected, 4 tests. PR #29 |
 | 2026-03-14 | 1 | 5 | Sequence integrity: per-pair monotonicity check in insert_message, corruption detection, 3 tests. PR #30 |
 | 2026-03-14 | 1 | 6 | Session limits: session_max_exchanges + coordinator_agent config, ESCALATION_KIND, session_message_count, 4 tests. PR #31 |
-| 2026-03-14 | 1 | 7, 8 | Promote-to-task: promoted column migration, StoredMessage, get_message, insert_promoted_message, handle_admin_ipc_promote, /admin/ipc/promote route, fetch_inbox quarantine queries updated, 7 tests. Final validation: fmt/clippy/test clean, 7296 passed. |
+| 2026-03-14 | 1 | 7, 8 | Promote-to-task: promoted column migration, StoredMessage, get_message, insert_promoted_message, handle_admin_ipc_promote, /admin/ipc/promote route, fetch_inbox quarantine queries updated, 7 tests. Final validation: fmt/clippy/test clean, 7310 passed. |

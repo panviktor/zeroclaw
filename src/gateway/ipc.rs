@@ -315,10 +315,13 @@ impl IpcDb {
         let messages: Vec<InboxMessage> = rows
             .map(|r| r.filter_map(|m| m.ok()).collect())
             .unwrap_or_default();
-        // Mark as read
-        let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        for id in &ids {
-            let _ = conn.execute("UPDATE messages SET read = 1 WHERE id = ?1", params![id]);
+        // Mark as read — but NOT quarantine messages (they stay unread until
+        // explicitly promoted or discarded by admin).
+        if !include_quarantine {
+            let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
+            for id in &ids {
+                let _ = conn.execute("UPDATE messages SET read = 1 WHERE id = ?1", params![id]);
+            }
         }
         messages
     }
@@ -2747,12 +2750,10 @@ mod tests {
         );
         assert_eq!(normal2[0].kind, PROMOTED_KIND);
 
-        // Quarantine still has original (unread L4), not the promoted one
-        // (first fetch marked previous quarantine message as read, so re-insert)
-        db.insert_message("kids", "opus", "text", "another", 4, None, 0, None)
-            .unwrap();
+        // Original L4 message is still in quarantine (quarantine fetch
+        // does NOT mark as read, so it persists)
         let q2 = db.fetch_inbox("opus", true, 50);
-        assert_eq!(q2.len(), 1);
+        assert_eq!(q2.len(), 1, "original quarantine message should still be there");
         assert_ne!(q2[0].kind, PROMOTED_KIND);
     }
 
@@ -2783,10 +2784,24 @@ mod tests {
         assert!(!msg.promoted, "new message should not be promoted");
         assert!(!msg.read, "new message should not be read");
 
-        // Mark as read via fetch_inbox
+        // Quarantine fetch does NOT mark as read (review-only lane)
         db.fetch_inbox("opus", true, 50);
         let msg2 = db.get_message(id).unwrap();
-        assert!(msg2.read, "fetched message should be marked read");
+        assert!(!msg2.read, "quarantine fetch must not mark as read");
+    }
+
+    #[test]
+    fn normal_fetch_marks_as_read() {
+        let db = test_db();
+        db.update_last_seen("worker", 3, "agent");
+        db.update_last_seen("opus", 1, "coordinator");
+        let id = db
+            .insert_message("opus", "worker", "task", "do it", 1, None, 0, None)
+            .unwrap();
+
+        db.fetch_inbox("worker", false, 50);
+        let msg = db.get_message(id).unwrap();
+        assert!(msg.read, "normal fetch should mark as read");
     }
 
     #[test]
@@ -2843,6 +2858,40 @@ mod tests {
             matches!(result, Err(IpcInsertError::SequenceViolation { .. })),
             "must return SequenceViolation, not generic Db error"
         );
+    }
+
+    #[test]
+    fn quarantine_fetch_does_not_block_promote() {
+        let db = test_db();
+        db.update_last_seen("kids", 4, "restricted");
+        db.update_last_seen("opus", 1, "coordinator");
+
+        // L4 sends message → quarantine
+        let id = db
+            .insert_message("kids", "opus", "text", "need help", 4, None, 0, None)
+            .unwrap();
+
+        // Admin reviews quarantine (fetch with quarantine=true)
+        let reviewed = db.fetch_inbox("opus", true, 50);
+        assert_eq!(reviewed.len(), 1);
+
+        // Message must still be promotable (not marked as read)
+        let msg = db.get_message(id).unwrap();
+        assert!(!msg.read, "quarantine review must not mark message as read");
+        assert!(!msg.promoted, "message should not yet be promoted");
+
+        // Promote should succeed
+        let result = db.insert_promoted_message(
+            &msg.from_agent,
+            "opus",
+            PROMOTED_KIND,
+            "promoted content",
+            msg.from_trust_level,
+            None,
+            0,
+            None,
+        );
+        assert!(result.is_ok(), "promote after quarantine review must succeed");
     }
 
     #[test]
