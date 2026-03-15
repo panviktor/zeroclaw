@@ -179,6 +179,26 @@ const translations: Record<Locale, Record<string, string>> = {
     'common.created': 'Created',
     'common.updated': 'Updated',
 
+    // IPC
+    'nav.ipc_section': 'IPC',
+    'nav.ipc_fleet': 'Fleet',
+    'nav.ipc_sessions': 'Sessions',
+    'nav.ipc_spawns': 'Spawns',
+    'nav.ipc_quarantine': 'Quarantine',
+    'nav.ipc_audit': 'Audit',
+    'ipc.fleet_title': 'Fleet Overview',
+    'ipc.fleet_placeholder': 'Fleet overview will be implemented in Step 3.',
+    'ipc.agent_detail_title': 'Agent Detail',
+    'ipc.agent_detail_placeholder': 'Agent detail will be implemented in Step 4.',
+    'ipc.sessions_title': 'Session Inspector',
+    'ipc.sessions_placeholder': 'Session inspector will be implemented in Step 5.',
+    'ipc.spawns_title': 'Spawn Monitor',
+    'ipc.spawns_placeholder': 'Spawn monitor will be implemented in Step 6.',
+    'ipc.quarantine_title': 'Quarantine Review',
+    'ipc.quarantine_placeholder': 'Quarantine review will be implemented in Step 7.',
+    'ipc.audit_title': 'Audit Viewer',
+    'ipc.audit_placeholder': 'Audit viewer will be implemented in Step 8.',
+
     // Health
     'health.title': 'System Health',
     'health.component': 'Component',
@@ -361,6 +381,26 @@ const translations: Record<Locale, Record<string, string>> = {
     'common.status': 'Durum',
     'common.created': 'Olusturulma',
     'common.updated': 'Guncellenme',
+
+    // IPC
+    'nav.ipc_section': 'IPC',
+    'nav.ipc_fleet': 'Filo',
+    'nav.ipc_sessions': 'Oturumlar',
+    'nav.ipc_spawns': 'Alt Surecler',
+    'nav.ipc_quarantine': 'Karantina',
+    'nav.ipc_audit': 'Denetim',
+    'ipc.fleet_title': 'Filo Genel Bakis',
+    'ipc.fleet_placeholder': 'Filo genel bakisi Adim 3\'te uygulanacaktir.',
+    'ipc.agent_detail_title': 'Ajan Detayi',
+    'ipc.agent_detail_placeholder': 'Ajan detayi Adim 4\'te uygulanacaktir.',
+    'ipc.sessions_title': 'Oturum Denetleyici',
+    'ipc.sessions_placeholder': 'Oturum denetleyicisi Adim 5\'te uygulanacaktir.',
+    'ipc.spawns_title': 'Alt Surec Izleyici',
+    'ipc.spawns_placeholder': 'Alt surec izleyicisi Adim 6\'da uygulanacaktir.',
+    'ipc.quarantine_title': 'Karantina Inceleme',
+    'ipc.quarantine_placeholder': 'Karantina incelemesi Adim 7\'de uygulanacaktir.',
+    'ipc.audit_title': 'Denetim Goruntuleyici',
+    'ipc.audit_placeholder': 'Denetim goruntuleyicisi Adim 8\'de uygulanacaktir.',
 
     // Health
     'health.title': 'Sistem Sagligi',

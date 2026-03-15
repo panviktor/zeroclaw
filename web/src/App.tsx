@@ -11,6 +11,12 @@ import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
+import IpcFleet from './pages/ipc/Fleet';
+import IpcAgentDetail from './pages/ipc/AgentDetail';
+import IpcSessions from './pages/ipc/Sessions';
+import IpcSpawns from './pages/ipc/Spawns';
+import IpcQuarantine from './pages/ipc/Quarantine';
+import IpcAudit from './pages/ipc/Audit';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
@@ -146,6 +152,13 @@ function AppContent() {
             <Route path="/cost" element={<Cost />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/doctor" element={<Doctor />} />
+            {/* IPC Phase 3.5 pages */}
+            <Route path="/ipc/fleet" element={<IpcFleet />} />
+            <Route path="/ipc/fleet/:agentId" element={<IpcAgentDetail />} />
+            <Route path="/ipc/sessions" element={<IpcSessions />} />
+            <Route path="/ipc/spawns" element={<IpcSpawns />} />
+            <Route path="/ipc/quarantine" element={<IpcQuarantine />} />
+            <Route path="/ipc/audit" element={<IpcAudit />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
