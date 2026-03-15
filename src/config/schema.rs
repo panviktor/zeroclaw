@@ -1291,6 +1291,13 @@ pub struct AgentsIpcConfig {
     #[serde(default = "default_ipc_role")]
     pub role: String,
 
+    /// Canonical agent ID for this instance. Must match the agent_id in the
+    /// broker's TokenMetadata (set during pairing via `POST /admin/paircode/new`).
+    /// Used for Ed25519 message signing context (Phase 3B).
+    /// If not set, falls back to ZEROCLAW_AGENT_ID env var or role.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
     /// Max outbound messages per hour (default: 60)
     #[serde(default = "default_max_messages_per_hour")]
     pub max_messages_per_hour: u32,
@@ -1416,6 +1423,7 @@ impl Default for AgentsIpcConfig {
             message_ttl_secs: default_message_ttl_secs(),
             trust_level: default_trust_level(),
             role: default_ipc_role(),
+            agent_id: None,
             max_messages_per_hour: default_max_messages_per_hour(),
             request_timeout_secs: default_ipc_request_timeout_secs(),
             lateral_text_pairs: Vec::new(),
@@ -5734,13 +5742,8 @@ impl Config {
 
                 if let Ok(agent_id) = std::env::var("ZEROCLAW_AGENT_ID") {
                     if !agent_id.is_empty() {
-                        // Use agent_id from env to determine trust level identity
-                        // (the broker already knows the real trust level from
-                        // the token metadata — this is just for local reference).
-                        tracing::info!(
-                            agent_id = agent_id,
-                            "IPC bootstrap: ephemeral agent identity from env"
-                        );
+                        self.agents_ipc.agent_id = Some(agent_id.clone());
+                        tracing::info!(agent_id = agent_id, "IPC bootstrap: agent_id set from env");
                     }
                 }
 

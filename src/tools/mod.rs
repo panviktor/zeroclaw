@@ -205,7 +205,11 @@ pub fn default_tools_with_runtime(
 }
 
 /// Create full tool registry including memory tools and optional Composio
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -219,7 +223,11 @@ pub fn all_tools(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
-) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
+) -> (
+    Vec<Box<dyn Tool>>,
+    Option<DelegateParentToolsHandle>,
+    Option<Arc<IpcClient>>,
+) {
     all_tools_with_runtime(
         config,
         security,
@@ -238,7 +246,11 @@ pub fn all_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio.
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -253,7 +265,11 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
-) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
+) -> (
+    Vec<Box<dyn Tool>>,
+    Option<DelegateParentToolsHandle>,
+    Option<Arc<IpcClient>>,
+) {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
@@ -362,6 +378,7 @@ pub fn all_tools_with_runtime(
     }
 
     // IPC tools (inter-agent communication via broker)
+    let mut ipc_client_for_registration: Option<Arc<IpcClient>> = None;
     if root_config.agents_ipc.enabled {
         if let Some(ref token) = root_config.agents_ipc.broker_token {
             let mut ipc_client = IpcClient::new(
@@ -378,9 +395,15 @@ pub fn all_tools_with_runtime(
                 .join("agent.key");
             match crate::security::identity::AgentIdentity::load_or_generate(&key_path) {
                 Ok(identity) => {
-                    let agent_id = root_config.agents_ipc.role.clone();
+                    // Resolve canonical agent_id: explicit config > env > role fallback
+                    let agent_id = root_config
+                        .agents_ipc
+                        .agent_id
+                        .clone()
+                        .unwrap_or_else(|| root_config.agents_ipc.role.clone());
                     tracing::info!(
                         key_path = %key_path.display(),
+                        agent_id = %agent_id,
                         pubkey = &identity.public_key_hex()[..16],
                         "Ed25519 agent identity loaded"
                     );
@@ -395,6 +418,9 @@ pub fn all_tools_with_runtime(
             }
 
             let ipc_client = Arc::new(ipc_client);
+            if ipc_client.has_identity() {
+                ipc_client_for_registration = Some(ipc_client.clone());
+            }
             tool_arcs.push(Arc::new(AgentsListTool::new(ipc_client.clone())));
             tool_arcs.push(Arc::new(AgentsSendTool::new(ipc_client.clone())));
             tool_arcs.push(Arc::new(AgentsInboxTool::new(ipc_client.clone())));
@@ -455,7 +481,11 @@ pub fn all_tools_with_runtime(
         Some(parent_tools)
     };
 
-    (boxed_registry_from_arcs(tool_arcs), delegate_handle)
+    (
+        boxed_registry_from_arcs(tool_arcs),
+        delegate_handle,
+        ipc_client_for_registration,
+    )
 }
 
 #[cfg(test)]
@@ -499,7 +529,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _) = all_tools(
+        let (tools, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -541,7 +571,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _) = all_tools(
+        let (tools, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -691,7 +721,7 @@ mod tests {
             },
         );
 
-        let (tools, _) = all_tools(
+        let (tools, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -724,7 +754,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _) = all_tools(
+        let (tools, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,

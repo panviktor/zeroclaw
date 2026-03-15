@@ -9,6 +9,13 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Resolve the ~/.zeroclaw directory for persisting sender_seq.
+fn home_zeroclaw_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".zeroclaw"))
+}
+
 // ── IpcClient ───────────────────────────────────────────────────
 
 /// HTTP client for communicating with the IPC broker gateway.
@@ -49,21 +56,80 @@ impl IpcClient {
     }
 
     /// Attach an Ed25519 identity for message signing.
+    ///
+    /// Also loads persisted sender_seq from disk (if available) to survive restarts.
     pub fn with_identity(
         mut self,
         identity: crate::security::identity::AgentIdentity,
         agent_id: String,
     ) -> Self {
+        // Load persisted sender_seq to survive restarts
+        let seq_path = self.sender_seq_path(&agent_id);
+        if let Some(path) = &seq_path {
+            if let Ok(data) = std::fs::read_to_string(path) {
+                if let Ok(seq) = data.trim().parse::<i64>() {
+                    self.sender_seq
+                        .store(seq, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(sender_seq = seq, "Loaded persisted sender_seq");
+                }
+            }
+        }
         self.identity = Some(identity);
         self.agent_id = Some(agent_id);
         self
     }
 
+    /// Path to the persisted sender_seq file (next to agent.key in config dir).
+    fn sender_seq_path(&self, _agent_id: &str) -> Option<std::path::PathBuf> {
+        // Store next to the broker_url-derived config dir.
+        // The key file is at ~/.zeroclaw/agent.key, so seq is ~/.zeroclaw/sender.seq
+        home_zeroclaw_dir().map(|d| d.join("sender.seq"))
+    }
+
+    /// Register the agent's Ed25519 public key with the broker.
+    /// Called once on startup so the broker can verify future message signatures.
+    pub async fn register_public_key(&self) -> Result<(), String> {
+        let identity = self.identity.as_ref().ok_or("No identity loaded")?;
+        let pubkey_hex = identity.public_key_hex();
+
+        let resp = self
+            .post(
+                "/api/ipc/register-key",
+                &serde_json::json!({ "public_key": pubkey_hex }),
+            )
+            .await
+            .map_err(|e| format!("register-key request failed: {e}"))?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(format!("register-key failed ({status}): {body}"))
+        }
+    }
+
+    /// Whether this client has an Ed25519 identity loaded.
+    pub fn has_identity(&self) -> bool {
+        self.identity.is_some()
+    }
+
     /// Get the next sender-side sequence number (monotonically increasing).
+    /// Persists to disk so the counter survives agent restarts.
     fn next_sender_seq(&self) -> i64 {
-        self.sender_seq
+        let seq = self
+            .sender_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
+            + 1;
+
+        // Persist to disk (best-effort — failure doesn't block sending)
+        if let Some(ref agent_id) = self.agent_id {
+            if let Some(path) = self.sender_seq_path(agent_id) {
+                let _ = std::fs::write(&path, seq.to_string());
+            }
+        }
+
+        seq
     }
 
     /// Sign a send body if identity is available.
