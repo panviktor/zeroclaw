@@ -55,6 +55,12 @@ impl AgentIdentity {
             }
             std::fs::write(path, pkcs8_bytes.as_ref())
                 .map_err(|e| format!("Failed to write key to {}: {e}", path.display()))?;
+            // Restrict key file permissions to owner-only (0o600).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
             let keypair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())
                 .map_err(|_| "Generated key failed to reload".to_string())?;
             Ok(Self { keypair })
@@ -86,16 +92,20 @@ impl AgentIdentity {
 
     /// Build the canonical signing payload for an IPC message.
     ///
-    /// Format: `{from_agent}|{to_agent}|{seq}|{payload_sha256}`
+    /// Format: `{from_agent}|{to_agent}|{seq}|{timestamp}|{payload_sha256}`
+    ///
+    /// This must match the format used in `agents_ipc.rs` (client-side signing)
+    /// and `gateway/ipc.rs` (broker-side verification).
     pub fn build_signing_payload(
         from_agent: &str,
         to_agent: &str,
         seq: i64,
+        timestamp: i64,
         payload: &str,
     ) -> Vec<u8> {
         use sha2::{Digest, Sha256};
         let payload_hash = hex::encode(Sha256::digest(payload.as_bytes()));
-        format!("{from_agent}|{to_agent}|{seq}|{payload_hash}").into_bytes()
+        format!("{from_agent}|{to_agent}|{seq}|{timestamp}|{payload_hash}").into_bytes()
     }
 
     /// Sign an IPC message payload.
@@ -104,9 +114,10 @@ impl AgentIdentity {
         from_agent: &str,
         to_agent: &str,
         seq: i64,
+        timestamp: i64,
         payload: &str,
     ) -> String {
-        let data = Self::build_signing_payload(from_agent, to_agent, seq, payload);
+        let data = Self::build_signing_payload(from_agent, to_agent, seq, timestamp, payload);
         self.sign(&data)
     }
 }
@@ -134,10 +145,11 @@ pub fn verify_message_signature(
     from_agent: &str,
     to_agent: &str,
     seq: i64,
+    timestamp: i64,
     payload: &str,
     signature_hex: &str,
 ) -> Result<(), String> {
-    let data = AgentIdentity::build_signing_payload(from_agent, to_agent, seq, payload);
+    let data = AgentIdentity::build_signing_payload(from_agent, to_agent, seq, timestamp, payload);
     verify_signature(public_key_hex, &data, signature_hex)
 }
 
@@ -223,13 +235,14 @@ mod tests {
     #[test]
     fn ipc_message_sign_verify_roundtrip() {
         let identity = AgentIdentity::generate().unwrap();
-        let sig = identity.sign_message("opus", "sentinel", 42, "check status");
+        let sig = identity.sign_message("opus", "sentinel", 42, 1_700_000_000, "check status");
 
         assert!(verify_message_signature(
             &identity.public_key_hex(),
             "opus",
             "sentinel",
             42,
+            1_700_000_000,
             "check status",
             &sig
         )
@@ -239,13 +252,14 @@ mod tests {
     #[test]
     fn ipc_message_wrong_payload_fails() {
         let identity = AgentIdentity::generate().unwrap();
-        let sig = identity.sign_message("opus", "sentinel", 42, "check status");
+        let sig = identity.sign_message("opus", "sentinel", 42, 1_700_000_000, "check status");
 
         let result = verify_message_signature(
             &identity.public_key_hex(),
             "opus",
             "sentinel",
             42,
+            1_700_000_000,
             "modified payload",
             &sig,
         );
@@ -255,13 +269,14 @@ mod tests {
     #[test]
     fn ipc_message_wrong_seq_fails() {
         let identity = AgentIdentity::generate().unwrap();
-        let sig = identity.sign_message("opus", "sentinel", 42, "check status");
+        let sig = identity.sign_message("opus", "sentinel", 42, 1_700_000_000, "check status");
 
         let result = verify_message_signature(
             &identity.public_key_hex(),
             "opus",
             "sentinel",
             99, // wrong seq
+            1_700_000_000,
             "check status",
             &sig,
         );

@@ -683,6 +683,15 @@ impl IpcDb {
         changed > 0
     }
 
+    /// Clear an agent's Ed25519 public key (used on ephemeral agent revoke).
+    pub fn clear_agent_public_key(&self, agent_id: &str) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "UPDATE agents SET public_key = NULL WHERE agent_id = ?1",
+            params![agent_id],
+        );
+    }
+
     /// Get an agent's registered Ed25519 public key.
     pub fn get_agent_public_key(&self, agent_id: &str) -> Option<String> {
         let conn = self.conn.lock();
@@ -2077,6 +2086,8 @@ pub fn revoke_ephemeral_agent(
 ) {
     // Remove token from runtime state
     let tokens_revoked = pairing.revoke_by_agent_id(agent_id);
+    // Clear public key to prevent key inheritance on agent_id reuse
+    db.clear_agent_public_key(agent_id);
     // Set agent status in IPC DB
     db.set_agent_status(agent_id, status);
     // Block pending messages

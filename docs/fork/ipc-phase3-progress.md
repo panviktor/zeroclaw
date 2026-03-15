@@ -101,6 +101,7 @@ All findings from two rounds of code review have been addressed:
 | 9 | HMAC audit chain | #53 | Done |
 | 10 | Sender-side replay protection | #54 | Done |
 | — | Operational fixes (agent_id, auto-register, persist seq) | #55 | Done |
+| — | Channel key registration, signing payload fix, key hardening | #58 | Done |
 
 ### What Phase 3B provides
 

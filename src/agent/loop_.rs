@@ -2998,43 +2998,8 @@ pub async fn run(
         );
 
     // ── Phase 3B: Auto-register Ed25519 public key with broker ────
-    // Retries with backoff to handle transient broker unavailability.
-    // If all retries fail, agent continues in unsigned mode (logged as error).
     if let Some(ref ipc_client) = ipc_client_for_key_reg {
-        let mut registered = false;
-        for attempt in 0..3 {
-            match ipc_client.register_public_key().await {
-                Ok(()) => {
-                    tracing::info!("Ed25519 public key registered with broker");
-                    registered = true;
-                    break;
-                }
-                Err(e) => {
-                    if attempt < 2 {
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            "Failed to register public key, retrying: {e}"
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(
-                            500 * (1 << attempt),
-                        ))
-                        .await;
-                    } else {
-                        tracing::error!(
-                            "Failed to register public key after 3 attempts: {e}. \
-                             Agent will operate in unsigned mode until next restart."
-                        );
-                    }
-                }
-            }
-        }
-        if !registered {
-            tracing::warn!(
-                "IPC signing degraded: messages will be sent unsigned. \
-                 Broker will accept them (no pubkey registered) but \
-                 provenance guarantees are not active."
-            );
-        }
+        ipc_client.register_public_key_with_retry().await;
     }
 
     let peripheral_tools: Vec<Box<dyn Tool>> =

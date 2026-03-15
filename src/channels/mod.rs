@@ -3507,7 +3507,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let (mut built_tools, delegate_handle_ch, _): (Vec<Box<dyn Tool>>, _, _) =
+    let (mut built_tools, delegate_handle_ch, ipc_client_for_key_reg): (Vec<Box<dyn Tool>>, _, _) =
         tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -3523,6 +3523,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
             config.api_key.as_deref(),
             &config,
         );
+
+    // ── Phase 3B: Auto-register Ed25519 public key with broker ────
+    if let Some(ref ipc_client) = ipc_client_for_key_reg {
+        ipc_client.register_public_key_with_retry().await;
+    }
 
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.

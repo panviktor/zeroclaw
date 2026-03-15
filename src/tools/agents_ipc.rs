@@ -113,6 +113,43 @@ impl IpcClient {
         self.identity.is_some()
     }
 
+    /// Register public key with broker, retrying up to 3 times with exponential backoff.
+    /// Returns `true` if registration succeeded, `false` if all attempts failed.
+    /// On failure the agent continues in unsigned mode (logged as error).
+    pub async fn register_public_key_with_retry(&self) -> bool {
+        for attempt in 0..3u32 {
+            match self.register_public_key().await {
+                Ok(()) => {
+                    tracing::info!("Ed25519 public key registered with broker");
+                    return true;
+                }
+                Err(e) => {
+                    if attempt < 2 {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            "Failed to register public key, retrying: {e}"
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            500 * (1u64 << attempt),
+                        ))
+                        .await;
+                    } else {
+                        tracing::error!(
+                            "Failed to register public key after 3 attempts: {e}. \
+                             Agent will operate in unsigned mode until next restart."
+                        );
+                    }
+                }
+            }
+        }
+        tracing::warn!(
+            "IPC signing degraded: messages will be sent unsigned. \
+             Broker will accept them (no pubkey registered) but \
+             provenance guarantees are not active."
+        );
+        false
+    }
+
     /// Get the next sender-side sequence number (monotonically increasing).
     /// Persists to disk so the counter survives agent restarts.
     fn next_sender_seq(&self) -> i64 {
