@@ -364,11 +364,37 @@ pub fn all_tools_with_runtime(
     // IPC tools (inter-agent communication via broker)
     if root_config.agents_ipc.enabled {
         if let Some(ref token) = root_config.agents_ipc.broker_token {
-            let ipc_client = Arc::new(IpcClient::new(
+            let mut ipc_client = IpcClient::new(
                 &root_config.agents_ipc.broker_url,
                 token,
                 root_config.agents_ipc.request_timeout_secs,
-            ));
+            );
+
+            // Phase 3B: Load or generate Ed25519 identity for message signing
+            let key_path = root_config
+                .config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("agent.key");
+            match crate::security::identity::AgentIdentity::load_or_generate(&key_path) {
+                Ok(identity) => {
+                    let agent_id = root_config.agents_ipc.role.clone();
+                    tracing::info!(
+                        key_path = %key_path.display(),
+                        pubkey = &identity.public_key_hex()[..16],
+                        "Ed25519 agent identity loaded"
+                    );
+                    ipc_client = ipc_client.with_identity(identity, agent_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to load Ed25519 identity — messages will be unsigned"
+                    );
+                }
+            }
+
+            let ipc_client = Arc::new(ipc_client);
             tool_arcs.push(Arc::new(AgentsListTool::new(ipc_client.clone())));
             tool_arcs.push(Arc::new(AgentsSendTool::new(ipc_client.clone())));
             tool_arcs.push(Arc::new(AgentsInboxTool::new(ipc_client.clone())));
