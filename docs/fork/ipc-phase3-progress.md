@@ -4,7 +4,7 @@ Plan: [`ipc-phase3-plan.md`](ipc-phase3-plan.md)
 
 ## Status: DONE
 
-All 6 implementation steps completed and merged.
+All implementation steps completed and merged, including runtime gap fixes and security hardening.
 
 ## Steps
 
@@ -17,6 +17,9 @@ All 6 implementation steps completed and merged.
 | 4 | Result delivery path + auto-revoke | #44 | Done |
 | 5 | Execution profiles — fail-closed sandbox | #45 | Done |
 | 6 | Integration wiring + docs | #46 | Done |
+| — | Runtime gap fixes (6 findings) | #47 | Done |
+| — | Child-side enforcement (allowlist, autonomy, prompt) | #48 | Done |
+| — | Allowlist bypass fix (MCP + delegate) | #49 | Done |
 
 ## What was built
 
@@ -74,6 +77,20 @@ All 6 implementation steps completed and merged.
 | `src/agent/prompt.rs` | 3 |
 | `src/security/execution.rs` | 5 |
 | `src/security/mod.rs` | 5 |
+| `src/agent/loop_.rs` | #48, #49 |
+
+## Security review findings (PRs #47-#49)
+
+All findings from two rounds of code review have been addressed:
+
+- IPC DB `None` in production gateway → init on startup + restart recovery (#47)
+- Subprocess had no sandbox wrapping → `std::process::Command` → `wrap_command()` → tokio (#47)
+- Workload profiles validated but not applied to child → env vars + child-side consumption (#47, #48)
+- Child didn't know parent_id → `ZEROCLAW_REPLY_TO` env var + prompt (#47)
+- Timeout didn't revoke child → lazy timeout in spawn-status endpoint (#47)
+- Legacy `wait=true` silently ignored → explicit error (#47)
+- MCP injected after allowlist filter → MCP suppressed under allowlist (#49)
+- Delegate held unfiltered parent_tools → delegate_handle filtered too (#49)
 
 ## What's next: Phase 3B (deferred)
 

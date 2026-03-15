@@ -2966,12 +2966,20 @@ pub async fn run(
     }
 
     // ── Phase 3A: Ephemeral agent tool allowlist enforcement ─────
-    // When ZEROCLAW_ALLOWED_TOOLS is set, hard-filter the registry to only
-    // those tools. This is a security boundary — not just a hint.
     //
-    // IMPORTANT: this filter must also cover delegate_handle and suppress
-    // MCP injection to be a true security boundary. An ephemeral child
-    // with an allowlist must not gain tools via MCP or delegate bypass.
+    // SAFETY INVARIANT: When ZEROCLAW_ALLOWED_TOOLS is set, this filter is
+    // a hard security boundary. ALL tool sources must be accounted for:
+    //
+    //   1. tools_registry  — filtered here (retain)
+    //   2. delegate_handle — filtered here (retain on parent_tools)
+    //   3. MCP tools       — suppressed entirely (guard below)
+    //
+    // If you add a new tool injection path (plugin system, remote tools,
+    // etc.), it MUST either:
+    //   (a) register tools BEFORE this filter, or
+    //   (b) be explicitly suppressed/filtered when ephemeral_allowlist is Some.
+    //
+    // Violating this invariant is a sandbox escape. See PRs #48-#49.
     let ephemeral_allowlist: Option<std::collections::HashSet<String>> =
         std::env::var("ZEROCLAW_ALLOWED_TOOLS")
             .ok()
