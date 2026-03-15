@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { t } from '@/lib/i18n';
 import { fetchMessages } from '@/lib/ipc-api';
@@ -9,6 +9,7 @@ import AgentLink from '@/components/ipc/AgentLink';
 import { TimeAbsolute } from '@/components/ipc/TimeAgo';
 import MessageDetail from '@/components/ipc/MessageDetail';
 import { redactPayload } from '@/components/ipc/redact';
+import { TIME_RANGES, timeRangeToTs } from '@/components/ipc/TimeRangeFilter';
 
 const KINDS = ['', 'text', 'task', 'query', 'result'];
 const LANES = ['', 'normal', 'quarantine', 'blocked'];
@@ -21,6 +22,8 @@ export default function Sessions() {
   const [loaded, setLoaded] = useState(false);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [hasMore, setHasMore] = useState(false);
+  const [timeRange, setTimeRange] = useState('');
+  const userInputRef = useRef(false);
 
   const agentId = searchParams.get('agent_id') ?? '';
   const sessionId = searchParams.get('session_id') ?? '';
@@ -35,6 +38,8 @@ export default function Sessions() {
       if (sessionId) filters.session_id = sessionId;
       if (kind) filters.kind = kind;
       if (lane) filters.lane = lane;
+      const fromTs = timeRangeToTs(timeRange);
+      if (fromTs) filters.from_ts = fromTs;
       const data = await fetchMessages(filters);
       if (offset === 0) {
         setMessages(data);
@@ -48,16 +53,21 @@ export default function Sessions() {
     } finally {
       setLoading(false);
     }
-  }, [agentId, sessionId, kind, lane]);
+  }, [agentId, sessionId, kind, lane, timeRange]);
 
-  // Auto-load when arriving with query params (e.g. from cross-links)
+  // Auto-load on navigation-driven param changes (cross-links, back/forward)
   useEffect(() => {
+    if (userInputRef.current) {
+      userInputRef.current = false;
+      return;
+    }
     if (agentId || sessionId || kind || lane) {
       doSearch(0);
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [agentId, sessionId, kind, lane, doSearch]);
 
   const updateParam = (key: string, value: string) => {
+    userInputRef.current = true;
     const params = new URLSearchParams(searchParams);
     if (value) params.set(key, value);
     else params.delete(key);
@@ -74,6 +84,7 @@ export default function Sessions() {
         <FilterInput label="Session" value={sessionId} onChange={(v) => updateParam('session_id', v)} placeholder="session_id" />
         <FilterSelect label="Kind" value={kind} options={KINDS} onChange={(v) => updateParam('kind', v)} />
         <FilterSelect label="Lane" value={lane} options={LANES} onChange={(v) => updateParam('lane', v)} />
+        <FilterSelect label="Time" value={timeRange} options={TIME_RANGES.map((r) => r.value)} onChange={setTimeRange} labels={TIME_RANGES.map((r) => r.label)} />
         <button
           onClick={() => doSearch(0)}
           disabled={loading}
@@ -179,8 +190,8 @@ function FilterInput({ label, value, onChange, placeholder }: {
   );
 }
 
-function FilterSelect({ label, value, options, onChange }: {
-  label: string; value: string; options: string[]; onChange: (v: string) => void;
+function FilterSelect({ label, value, options, onChange, labels }: {
+  label: string; value: string; options: string[]; onChange: (v: string) => void; labels?: string[];
 }) {
   return (
     <div className="space-y-1">
@@ -190,8 +201,8 @@ function FilterSelect({ label, value, options, onChange }: {
         onChange={(e) => onChange(e.target.value)}
         className="input-electric px-3 py-2 text-sm"
       >
-        {options.map((o) => (
-          <option key={o} value={o}>{o || 'all'}</option>
+        {options.map((o, i) => (
+          <option key={o} value={o}>{labels ? labels[i] : (o || 'all')}</option>
         ))}
       </select>
     </div>

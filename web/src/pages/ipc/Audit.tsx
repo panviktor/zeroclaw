@@ -3,6 +3,7 @@ import { t } from '@/lib/i18n';
 import { fetchAudit, verifyAuditChain } from '@/lib/ipc-api';
 import type { IpcAuditEvent, AuditFilter } from '@/types/ipc';
 import { TimeAbsolute } from '@/components/ipc/TimeAgo';
+import { TIME_RANGES, timeRangeToTs } from '@/components/ipc/TimeRangeFilter';
 
 const EVENT_TYPES = ['', 'ipc_send', 'ipc_received', 'ipc_blocked', 'ipc_admin_action', 'ipc_rate_limited', 'ipc_state_change'];
 const PAGE_SIZE = 50;
@@ -16,6 +17,7 @@ export default function Audit() {
   const [agentId, setAgentId] = useState('');
   const [eventType, setEventType] = useState('');
   const [search, setSearch] = useState('');
+  const [timeRange, setTimeRange] = useState('');
   const [verifyResult, setVerifyResult] = useState<{ ok: boolean; verified?: number; error?: string } | null>(null);
   const [verifying, setVerifying] = useState(false);
 
@@ -26,6 +28,8 @@ export default function Audit() {
       if (agentId) filters.agent_id = agentId;
       if (eventType) filters.event_type = eventType;
       if (search) filters.search = search;
+      const fromTs = timeRangeToTs(timeRange);
+      if (fromTs) filters.from_ts = fromTs;
       const data = await fetchAudit(filters);
       if (offset === 0) setEvents(data);
       else setEvents((prev) => [...prev, ...data]);
@@ -36,7 +40,7 @@ export default function Audit() {
     } finally {
       setLoading(false);
     }
-  }, [agentId, eventType, search]);
+  }, [agentId, eventType, search, timeRange]);
 
   const handleVerify = async () => {
     setVerifying(true);
@@ -79,6 +83,12 @@ export default function Audit() {
         <div className="space-y-1">
           <label className="text-xs text-[#556080] uppercase tracking-wider">Search</label>
           <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="keyword" className="input-electric px-3 py-2 text-sm w-40" />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-[#556080] uppercase tracking-wider">Time</label>
+          <select value={timeRange} onChange={(e) => setTimeRange(e.target.value)} className="input-electric px-3 py-2 text-sm">
+            {TIME_RANGES.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
+          </select>
         </div>
         <button onClick={() => doSearch(0)} disabled={loading} className="btn-electric px-4 py-2 text-sm font-medium">
           {loading ? 'Loading...' : 'Search'}

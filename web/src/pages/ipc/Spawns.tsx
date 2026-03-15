@@ -7,6 +7,7 @@ import StatusBadge from '@/components/ipc/StatusBadge';
 import AgentLink from '@/components/ipc/AgentLink';
 import { TimeAbsolute, TimeUntil } from '@/components/ipc/TimeAgo';
 import ConfirmDialog from '@/components/ipc/ConfirmDialog';
+import { TIME_RANGES, timeRangeToTs } from '@/components/ipc/TimeRangeFilter';
 
 const STATUSES = ['', 'running', 'completed', 'timeout', 'revoked', 'interrupted'];
 const PAGE_SIZE = 50;
@@ -18,6 +19,7 @@ export default function Spawns() {
   const [hasMore, setHasMore] = useState(false);
   const [status, setStatus] = useState('');
   const [parentId, setParentId] = useState('');
+  const [timeRange, setTimeRange] = useState('');
   const [revokeTarget, setRevokeTarget] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
@@ -27,6 +29,8 @@ export default function Spawns() {
       const filters: SpawnRunsFilter = { limit: PAGE_SIZE, offset };
       if (status) filters.status = status;
       if (parentId) filters.parent_id = parentId;
+      const fromTs = timeRangeToTs(timeRange);
+      if (fromTs) filters.from_ts = fromTs;
       const data = await fetchSpawnRuns(filters);
       if (offset === 0) setRuns(data);
       else setRuns((prev) => [...prev, ...data]);
@@ -37,7 +41,7 @@ export default function Spawns() {
     } finally {
       setLoading(false);
     }
-  }, [status, parentId]);
+  }, [status, parentId, timeRange]);
 
   const handleRevoke = async () => {
     if (!revokeTarget) return;
@@ -65,6 +69,12 @@ export default function Spawns() {
         <div className="space-y-1">
           <label className="text-xs text-[#556080] uppercase tracking-wider">Parent</label>
           <input type="text" value={parentId} onChange={(e) => setParentId(e.target.value)} placeholder="parent_id" className="input-electric px-3 py-2 text-sm w-40" />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-[#556080] uppercase tracking-wider">Time</label>
+          <select value={timeRange} onChange={(e) => setTimeRange(e.target.value)} className="input-electric px-3 py-2 text-sm">
+            {TIME_RANGES.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
+          </select>
         </div>
         <button onClick={() => doSearch(0)} disabled={loading} className="btn-electric px-4 py-2 text-sm font-medium">
           {loading ? 'Loading...' : 'Search'}
