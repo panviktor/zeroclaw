@@ -3525,8 +3525,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
 
     // ── Phase 3B: Auto-register Ed25519 public key with broker ────
+    // Tries 3 times with backoff; if all fail, spawns a background task
+    // that retries every 30s until the broker becomes available.
     if let Some(ref ipc_client) = ipc_client_for_key_reg {
-        ipc_client.register_public_key_with_retry().await;
+        ipc_client.register_public_key_with_background_retry().await;
     }
 
     // Wire MCP tools into the registry before freezing — non-fatal.

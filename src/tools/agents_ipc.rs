@@ -136,7 +136,7 @@ impl IpcClient {
                     } else {
                         tracing::error!(
                             "Failed to register public key after 3 attempts: {e}. \
-                             Agent will operate in unsigned mode until next restart."
+                             Will continue retrying in background."
                         );
                     }
                 }
@@ -147,6 +147,37 @@ impl IpcClient {
              Broker will accept them (no pubkey registered) but \
              provenance guarantees are not active."
         );
+        false
+    }
+
+    /// Register public key with broker, with foreground fast retry.
+    /// If foreground registration fails, spawns a background task that retries
+    /// every 30 seconds until successful — avoids permanent unsigned mode from
+    /// transient broker outage on startup.
+    pub async fn register_public_key_with_background_retry(self: &Arc<Self>) -> bool {
+        if self.register_public_key_with_retry().await {
+            return true;
+        }
+        // Foreground failed — spawn background retry task
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            interval.tick().await; // skip immediate tick
+            loop {
+                interval.tick().await;
+                match client.register_public_key().await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Ed25519 public key registered with broker (background retry)"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Background key registration retry failed: {e}");
+                    }
+                }
+            }
+        });
         false
     }
 
@@ -1348,8 +1379,8 @@ mod tests {
     // and exercise the tool execute() path end-to-end.
 
     use crate::gateway::ipc::{
-        handle_ipc_agents, handle_ipc_inbox, handle_ipc_send, handle_ipc_state_get,
-        handle_ipc_state_set, IpcDb,
+        handle_ipc_agents, handle_ipc_inbox, handle_ipc_register_key, handle_ipc_send,
+        handle_ipc_state_get, handle_ipc_state_set, IpcDb,
     };
     use crate::gateway::AppState;
     use axum::{routing::get, routing::post, Router};
@@ -1490,6 +1521,7 @@ mod tests {
                 "/api/ipc/state",
                 get(handle_ipc_state_get).post(handle_ipc_state_set),
             )
+            .route("/api/ipc/register-key", post(handle_ipc_register_key))
             .with_state(state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1613,6 +1645,46 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.output.contains("unknown_recipient") || result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn http_roundtrip_signed_message_verified_by_broker() {
+        // End-to-end: register key → send signed message → broker verifies signature.
+        let db = Arc::new(IpcDb::open_in_memory().unwrap());
+        db.update_last_seen("test-agent", 1, "coordinator");
+        db.update_last_seen("worker", 3, "agent");
+        let state = test_app_state(db.clone(), TEST_TOKEN_HASH);
+        let url = start_test_server(state).await;
+
+        // Create client with Ed25519 identity
+        let identity = crate::security::identity::AgentIdentity::generate().unwrap();
+        let client = Arc::new(
+            IpcClient::new(&url, TEST_TOKEN_RAW, 5)
+                .with_identity(identity, "test-agent".to_string()),
+        );
+
+        // Register public key with broker
+        let reg_result = client.register_public_key().await;
+        assert!(
+            reg_result.is_ok(),
+            "register_public_key failed: {reg_result:?}"
+        );
+
+        // Verify key is stored
+        let stored_key = db.get_agent_public_key("test-agent");
+        assert!(stored_key.is_some(), "Public key not stored in DB");
+
+        // Send a signed message — broker should accept it
+        let send_tool = AgentsSendTool::new(client.clone());
+        let result = send_tool
+            .execute(json!({
+                "to": "worker",
+                "kind": "task",
+                "payload": "signed task"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "Signed send failed: {:?}", result.error);
     }
 
     // ── Spec + unit tests ─────────────────────────────────────────

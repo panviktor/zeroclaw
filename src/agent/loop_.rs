@@ -2998,8 +2998,10 @@ pub async fn run(
         );
 
     // ── Phase 3B: Auto-register Ed25519 public key with broker ────
+    // Tries 3 times with backoff; if all fail, spawns a background task
+    // that retries every 30s until the broker becomes available.
     if let Some(ref ipc_client) = ipc_client_for_key_reg {
-        ipc_client.register_public_key_with_retry().await;
+        ipc_client.register_public_key_with_background_retry().await;
     }
 
     let peripheral_tools: Vec<Box<dyn Tool>> =

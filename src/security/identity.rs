@@ -42,6 +42,23 @@ impl AgentIdentity {
         if path.exists() {
             let der = std::fs::read(path)
                 .map_err(|e| format!("Failed to read key at {}: {e}", path.display()))?;
+            // Fix permissions on existing key files that may have been created
+            // before the 0o600 hardening was added.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        tracing::warn!(
+                            "Ed25519 key file {} has overly permissive mode {:o}, restricting to 0600",
+                            path.display(),
+                            meta.permissions().mode() & 0o777
+                        );
+                        let _ =
+                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
             let keypair = Ed25519KeyPair::from_pkcs8(&der)
                 .map_err(|e| format!("Invalid Ed25519 key at {}: {e}", path.display()))?;
             Ok(Self { keypair })
