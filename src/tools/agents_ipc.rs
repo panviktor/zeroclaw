@@ -79,11 +79,10 @@ impl IpcClient {
         self
     }
 
-    /// Path to the persisted sender_seq file (next to agent.key in config dir).
-    fn sender_seq_path(&self, _agent_id: &str) -> Option<std::path::PathBuf> {
-        // Store next to the broker_url-derived config dir.
-        // The key file is at ~/.zeroclaw/agent.key, so seq is ~/.zeroclaw/sender.seq
-        home_zeroclaw_dir().map(|d| d.join("sender.seq"))
+    /// Path to the persisted sender_seq file, per agent_id.
+    /// Multiple agents on the same host get independent counters.
+    fn sender_seq_path(&self, agent_id: &str) -> Option<std::path::PathBuf> {
+        home_zeroclaw_dir().map(|d| d.join(format!("sender-{agent_id}.seq")))
     }
 
     /// Register the agent's Ed25519 public key with the broker.

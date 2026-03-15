@@ -63,11 +63,12 @@ broker_url = "http://127.0.0.1:42617"
 broker_token = "<token-from-pairing>"
 trust_level = 3
 role = "worker"
+agent_id = "code"           # Must match the agent_id used in POST /admin/paircode/new
 request_timeout_secs = 10
 max_messages_per_hour = 60
 ```
 
-> `trust_level` and `role` here are local hints for `agents_spawn` propagation. The **broker** determines the real trust level from `token_metadata` set during pairing.
+> **Important**: `agent_id` must match the `agent_id` in the broker's `token_metadata` (set during pairing via `POST /admin/paircode/new`). This is used for Ed25519 message signing — a mismatch causes `signature_invalid`. If not set, falls back to `role`, which will break if the broker paired this agent with a different agent_id.
 
 ---
 
@@ -82,6 +83,7 @@ broker_url = "http://127.0.0.1:42617"
 broker_token = "<token-from-pairing>"
 trust_level = 4
 role = "restricted"
+agent_id = "kids"           # Must match pairing agent_id
 request_timeout_secs = 10
 max_messages_per_hour = 30
 ```
