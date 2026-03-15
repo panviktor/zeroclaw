@@ -6,18 +6,17 @@ Phase 3.5: human control plane | **Phase 3.6: agent provisioning** | Phase 4: fe
 
 ## What Phase 3.6 gives
 
-Four promises to the operator:
+Three promises to the operator:
 
-1. **One-click agent provisioning** — create a new agent identity, pick a preset, get a ready-to-use config.toml and pairing code — all from the web UI.
-2. **Fleet blueprints** — pre-built multi-agent configurations for real-world scenarios (marketing pipeline, office assistant, dev team, family, research bureau). Deploy an entire coordinated fleet, not just individual agents.
-3. **Full provider & channel catalog** — every provider and channel ZeroClaw supports is available in a dropdown. Users enter only their API keys and bot tokens.
-4. **Full lifecycle from UI** — add, configure, pair, revoke, delete — without ever touching curl or TOML by hand.
+1. **Single-agent provisioning from UI** — create identity, pick a preset, enter credentials, get a ready-to-use config.toml and pairing code. Full flow without curl or TOML editing.
+2. **Fleet blueprints** — pre-built multi-agent topologies for real-world scenarios. Generate all agent configs + pairing codes in one flow. **Honest scope**: blueprint generates configs and codes, but broker-side IPC wiring (lateral pairs, l4 destinations) requires a manual config patch on the broker — this is documented as a post-deploy step, not hidden.
+3. **Full lifecycle from UI** — add, pair, revoke, delete single agents entirely from the web UI.
 
 ---
 
 ## Why Phase 3.6 exists
 
-Phase 3.5 gave the operator **visibility and intervention** — they can see agents, inspect messages, quarantine, revoke. But creating a new agent still requires:
+Phase 3.5 gave the operator **visibility and intervention**. But creating a new agent still requires:
 
 1. `curl POST /admin/paircode/new` with JSON body
 2. Manually writing a `config.toml` with provider keys, channel tokens, IPC settings
@@ -25,39 +24,20 @@ Phase 3.5 gave the operator **visibility and intervention** — they can see age
 4. Running `zeroclaw pair` with the code
 5. Starting the daemon
 
-Deploying a coordinated multi-agent fleet means repeating this 4-8 times, plus manually configuring lateral_text_pairs, l4_destinations, and trust relationships.
-
-This is fine for the developer who built the system. It is not fine for a family member, a collaborator, or even the same developer six months later.
-
 With Phase 3.6:
-- Fleet Overview has "Add Agent" and "Deploy Blueprint" buttons
-- A guided form collects: preset/blueprint, names, provider keys, channel tokens
-- The system generates complete config.toml files ready to download (one per agent, or a zip for blueprints)
-- Pairing codes are shown with copy-to-clipboard
-- Agents appear in Fleet immediately after pairing
+- Fleet Overview has an "Add Agent" button → guided form → download config + pairing code
+- "Deploy Blueprint" generates N configs + codes for a coordinated fleet
+- "Delete" revokes and hides agents from Fleet
 
 ---
 
 ## Non-goals
 
-- Not a remote deployment system (config must still be placed on target machines manually or via SSH)
-- Not a visual TOML editor for all 200+ config fields (the existing `/config` page handles that)
-- Not a multi-host orchestration layer (Phase 4)
+- Not a remote deployment system (configs placed manually or via SSH)
+- Not a visual TOML editor for all 200+ fields
 - Not auto-discovery of agents on the network
-- Not a custom blueprint builder (v1 ships static blueprints; user-defined blueprints are Phase 4)
-
----
-
-## Relationship to existing UI
-
-```
-/agent          → Talk to THIS agent (chat interface)
-/config         → Edit THIS agent's config (TOML editor)
-/ipc/fleet      → See ALL agents + provision new ones (Phase 3.6)
-  ├─ Add Agent  → Single agent: preset → credentials → download config + pairing code
-  └─ Blueprint  → Multi-agent fleet: scenario → credentials → download all configs + codes
-/ipc/fleet/:id  → Inspect ONE agent (detail, messages, spawns)
-```
+- Not a custom blueprint builder (static blueprints in v1; user-defined = Phase 4)
+- Not broker-side IPC wiring from UI (lateral_text_pairs, l4_destinations remain in broker config.toml)
 
 ---
 
@@ -65,154 +45,125 @@ With Phase 3.6:
 
 ### AD-1: Config generation is client-side, not broker-side
 
-The browser assembles TOML configs from templates + user inputs and offers them as downloads. The broker **never sees or stores** the new agent's provider API keys or channel tokens.
+The browser assembles TOML configs from templates + user inputs and offers them as downloads. The broker **never sees or stores** agent provider API keys or channel tokens.
 
-**Why**: the broker stores only identity metadata (agent_id, trust_level, role, public_key). Sending provider credentials to the broker would create a credential aggregation risk — one compromised broker leaks all agents' API keys.
-
-**Consequence**: the "Download config" button generates the file in-browser via Blob URL. No `POST /admin/generate-config` endpoint. For blueprints, a zip is generated client-side.
+**Why**: credential aggregation risk — one compromised broker would leak all agents' API keys.
 
 ### AD-2: Two levels of presets — agents and blueprints
 
-- **Agent presets** (5): define a single agent's trust, role, model, tools, prompt. Used in "Add Agent" flow.
-- **Fleet blueprints** (5+): define a coordinated multi-agent topology — which agent presets to use, how they connect (lateral pairs, l4 destinations), what the coordinator's prompt says about delegation. Used in "Deploy Blueprint" flow.
+- **Agent presets** (5): single agent's trust, role, model, tools, prompt.
+- **Fleet blueprints** (5): coordinated multi-agent topology with named agents, preset assignments, and IPC wiring specification.
 
-Both are static TypeScript data, version-controlled with the UI code.
+Both are static TypeScript data, version-controlled with the UI.
 
-### AD-3: Provider catalog mirrors the onboarding wizard
+### AD-3: Blueprint generates configs + codes, not broker wiring
 
-The provider selection in the UI uses the same tiers and provider IDs as the CLI wizard (`src/onboard/wizard.rs`). This ensures config compatibility — a config generated from the UI will work identically to one created by the wizard.
+A blueprint produces: N agent config.toml files + N pairing codes + a **broker config patch snippet** (lateral_text_pairs, l4_destinations) that the operator pastes into the broker's config.toml.
 
-### AD-4: Channel catalog covers all supported channels
+**Why**: the broker's `agents_ipc` section is not exposed via an API endpoint for live patching. Adding a config-mutation API is scope for Phase 4. For v1, the snippet + manual paste is honest and safe.
 
-Every channel with a config struct in `schema.rs` is available in the dropdown, with per-channel credential fields. Channels with compile-time feature gates (Matrix, Nostr) show a note about required build flags.
+### AD-4: Curated provider subset for v1; full catalog for v2
 
-### AD-5: Pairing is still two-step (create code → exchange code)
+v1 ships with **Tier 1 (Recommended) + Tier 5 (Local) + Custom** — about 15 providers. The remaining 25+ specialized/China/gateway providers are deferred to v2 to avoid a static catalog that drifts from `wizard.rs` on every upstream sync.
 
-The UI generates a pairing code via `POST /admin/paircode/new` with agent metadata. The operator copies the code to the new agent instance. No change from the existing flow.
+**Why**: 40+ providers in a static TS module is a maintenance burden. Tier 1 + Local + Custom covers 90%+ of real use cases. Specialized providers can be reached via Custom (BYOP) with a base URL.
 
-### AD-6: Delete = revoke + cleanup, not a new endpoint
+### AD-5: Channel catalog = agent-facing transports only
 
-"Delete agent" means: revoke token → set status=revoked → hide from default view. Audit trail preserved. Reuses existing `/admin/ipc/revoke`.
+The channel picker in the UI includes only real bidirectional agent channels that an operator would assign to an agent instance. Excluded from v1:
+
+- **webhook** — an inbound listener endpoint, not a user-facing chat transport. Excluded from channel picker.
+- **mqtt** — a SOP listener path, not a ChannelsConfig transport. Excluded.
+- **clawdtalk** — the built-in web chat, auto-configured. No credentials needed.
+- **whatsapp_web** — not a separate channel; it's a mode inside `WhatsAppConfig` (set `session_path` instead of `access_token`). Shown as a toggle within the WhatsApp channel form, not a separate entry.
+
+### AD-6: Delete = revoke + hide
+
+"Delete agent" = revoke token → set status=revoked → hide from default Fleet view. Audit trail preserved. Reuses existing `/admin/ipc/revoke`.
 
 ---
 
-## Provider Catalog
-
-Organized by tier, matching the CLI wizard exactly.
+## Provider Catalog (v1 scope)
 
 ### Tier 1 — Recommended
 
-| ID | Name | Credential | Notes |
-|----|------|-----------|-------|
-| `openrouter` | OpenRouter | API key | 200+ models, single key |
-| `venice` | Venice AI | API key | Privacy-first |
-| `anthropic` | Anthropic | API key | Claude Sonnet, Opus |
-| `openai` | OpenAI | API key | GPT-4o, o1, GPT-5 |
-| `openai-codex` | OpenAI Codex | OAuth (no key) | ChatGPT subscription |
-| `deepseek` | DeepSeek | API key | V3 & R1 |
-| `mistral` | Mistral | API key | Large, Codestral |
-| `xai` | xAI | API key | Grok 3 & 4 |
-| `perplexity` | Perplexity | API key | Search-augmented |
-| `gemini` | Google Gemini | API key or CLI auth | Flash & Pro |
-
-### Tier 2 — Fast Inference
-
-| ID | Name | Credential |
-|----|------|-----------|
-| `groq` | Groq | API key |
-| `fireworks` | Fireworks AI | API key |
-| `novita` | Novita AI | API key |
-| `together-ai` | Together AI | API key |
-| `nvidia` | NVIDIA NIM | API key |
-
-### Tier 3 — Gateway / Proxy
-
-| ID | Name | Credential |
-|----|------|-----------|
-| `vercel` | Vercel AI Gateway | API key |
-| `cloudflare` | Cloudflare AI Gateway | API key |
-| `astrai` | Astrai | API key |
-| `bedrock` | Amazon Bedrock | AWS credentials |
-
-### Tier 4 — Specialized (China & niche)
-
-| ID | Name | Credential | Notes |
-|----|------|-----------|-------|
-| `kimi-code` | Kimi Code | API key | Coding-optimized |
-| `qwen-code` | Qwen Code | OAuth | ~/.qwen/oauth_creds.json |
-| `moonshot` | Moonshot/Kimi (CN) | API key | China endpoint |
-| `moonshot-intl` | Moonshot/Kimi (intl) | API key | International |
-| `glm` | GLM/Zhipu (intl) | API key | ChatGLM |
-| `glm-cn` | GLM/Zhipu (CN) | API key | China endpoint |
-| `minimax` | MiniMax (intl) | API key | |
-| `minimax-cn` | MiniMax (CN) | API key | |
-| `qwen` | Qwen/DashScope (CN) | API key | |
-| `qwen-intl` | Qwen/DashScope (intl) | API key | |
-| `qwen-us` | Qwen/DashScope (US) | API key | |
-| `qianfan` | Qianfan/Baidu (CN) | API key | |
-| `zai` | Z.AI (global) | API key | Coding |
-| `zai-cn` | Z.AI (CN) | API key | |
-| `synthetic` | Synthetic AI | API key | |
-| `opencode` | OpenCode Zen | API key | |
-| `opencode-go` | OpenCode Go | API key | Subsidized |
-| `cohere` | Cohere | API key | Command R+ |
+| ID | Name | Credential | Default model |
+|----|------|-----------|--------------|
+| `anthropic` | Anthropic | API key | claude-sonnet-4-6 |
+| `openai` | OpenAI | API key | gpt-4o |
+| `openrouter` | OpenRouter | API key | (user picks) |
+| `deepseek` | DeepSeek | API key | deepseek-chat |
+| `mistral` | Mistral | API key | mistral-large-latest |
+| `xai` | xAI | API key | grok-3 |
+| `gemini` | Google Gemini | API key | gemini-2.0-flash |
+| `groq` | Groq | API key | llama-3.3-70b |
+| `perplexity` | Perplexity | API key | sonar |
+| `venice` | Venice AI | API key | (user picks) |
 
 ### Tier 5 — Local / Private
 
 | ID | Name | Credential | Notes |
 |----|------|-----------|-------|
-| `ollama` | Ollama | None | Llama, Mistral, Phi |
-| `llamacpp` | llama.cpp server | None | OpenAI-compatible |
-| `sglang` | SGLang | None | High-performance |
-| `vllm` | vLLM | None | High-performance |
-| `osaurus` | Osaurus | None | Edge runtime |
+| `ollama` | Ollama | None | base_url default: http://localhost:11434 |
+| `llamacpp` | llama.cpp server | None | base_url required |
+| `vllm` | vLLM | None | base_url required |
 
-### Tier 6 — Custom (BYOP)
+### Custom (BYOP)
 
 Any OpenAI-compatible API: base_url + optional API key + model name.
 
+### Deferred to v2
+
+Tiers 2 (Fast inference), 3 (Gateway/proxy), 4 (Specialized/China) — fireworks, together-ai, nvidia, vercel, cloudflare, bedrock, kimi, qwen, glm, minimax, qianfan, zai, cohere, etc. Reachable via Custom in v1.
+
 ---
 
-## Channel Catalog
+## Channel Catalog (v1 scope)
+
+Agent-facing bidirectional transports only. Fields verified against `schema.rs`.
 
 ### Messaging
 
-| ID | Name | Credentials needed |
-|----|------|-------------------|
-| `telegram` | Telegram | bot_token, allowed_users |
-| `discord` | Discord | bot_token, guild_id, allowed_users |
-| `slack` | Slack | bot_token, app_token, channel_id, allowed_users |
-| `matrix` | Matrix | homeserver, access_token or password, room_id, allowed_users |
-| `mattermost` | Mattermost | url, bot_token, channel_id, allowed_users |
-| `signal` | Signal | phone_number, signal_cli_path |
-| `whatsapp` | WhatsApp (Cloud) | access_token, phone_number_id, verify_token |
-| `whatsapp_web` | WhatsApp Web | session data (feature: whatsapp-web) |
-| `imessage` | iMessage | applescript_path (macOS only) |
-| `irc` | IRC | server, port, nick, channel, password |
+| ID | Name | Required fields | Optional fields |
+|----|------|----------------|-----------------|
+| `telegram` | Telegram | `bot_token`, `allowed_users` | `stream_mode`, `mention_only`, `interrupt_on_new_message` |
+| `discord` | Discord | `bot_token`, `allowed_users` | `guild_id`, `listen_to_bots`, `mention_only` |
+| `slack` | Slack | `bot_token`, `allowed_users` | `app_token`, `channel_id`, `interrupt_on_new_message` |
+| `mattermost` | Mattermost | `url`, `bot_token`, `allowed_users` | `channel_id`, `thread_replies`, `mention_only` |
+| `matrix` | Matrix | `homeserver`, `room_id`, `allowed_users` | `access_token` or `password`+`user_id`, `device_id` |
+| `signal` | Signal | `http_url`, `account` | `group_id`, `allowed_from`, `ignore_attachments` |
+| `whatsapp` | WhatsApp (Cloud) | `access_token`, `phone_number_id`, `allowed_numbers` | `verify_token`, `app_secret` |
+| `whatsapp` (web mode) | WhatsApp (Web) | `session_path`, `allowed_numbers` | `pair_phone`, `pair_code` |
+| `imessage` | iMessage | `allowed_contacts` | — (macOS only) |
+| `irc` | IRC | `server`, `nick`, `channel` | `port`, `password`, `use_tls` |
 
-### Work / China
+### Work / Enterprise
 
-| ID | Name | Credentials needed |
-|----|------|-------------------|
-| `lark` | Lark/Feishu | app_id, app_secret |
-| `dingtalk` | DingTalk | app_key, app_secret, robot_code |
-| `wecom` | WeCom (企业微信) | corp_id, agent_id, secret |
-| `qq` | QQ | app_id, token |
-| `clawdtalk` | ClawdTalk | built-in web chat |
+| ID | Name | Required fields | Optional fields |
+|----|------|----------------|-----------------|
+| `lark` | Lark / Feishu | `app_id`, `app_secret` | `verification_token`, `encrypt_key` |
+| `dingtalk` | DingTalk | `app_key`, `app_secret`, `robot_code` | `allowed_users` |
+| `wecom` | WeCom | `webhook_key` | `allowed_users` |
+| `qq` | QQ Official | `app_id`, `app_secret` | `allowed_users` |
+| `nextcloud_talk` | Nextcloud Talk | `url`, `token`, `room_token` | `allowed_users` |
 
-### Infrastructure
+### Feature-gated
 
-| ID | Name | Credentials needed |
-|----|------|-------------------|
-| `webhook` | Webhook | url, secret |
-| `mqtt` | MQTT | broker_url, topic, username, password |
-| `nostr` | Nostr | private_key, relays (feature: channel-nostr) |
-| `nextcloud_talk` | Nextcloud Talk | url, token, room_token |
-| `linq` | LinQ | api_key, workspace_id |
+| ID | Build flag | Notes |
+|----|-----------|-------|
+| `matrix` | `--features channel-matrix` | UI shows warning if not built with flag |
+| `nostr` | `--features channel-nostr` | Deferred to v2 (niche) |
+| `whatsapp` (web) | `--features whatsapp-web` | Toggle within WhatsApp form |
 
-### Notes
-- `email` — incoming: IMAP polling, outgoing: SMTP. Credentials: imap_host, smtp_host, username, password
-- Channels with feature gates (`matrix`, `nostr`, `whatsapp_web`) show a build flag reminder in the UI
+### Excluded from v1 channel picker
+
+| What | Why |
+|------|-----|
+| `webhook` | Inbound listener, not a user-facing chat transport |
+| `mqtt` | SOP listener, not a ChannelsConfig transport |
+| `clawdtalk` | Built-in web chat, auto-configured, no credentials |
+| `linq` | Niche SMS API |
+| `nostr` | Niche, feature-gated, complex key management |
 
 ---
 
@@ -220,175 +171,150 @@ Any OpenAI-compatible API: base_url + optional API key + model name.
 
 ### 1. Coordinator (L1)
 
-**For**: the main orchestrator.
-
 | Field | Default |
 |-------|---------|
 | trust_level | 1 |
 | role | coordinator |
-| suggested_model | `claude-opus-4-6` via anthropic, or best available |
-| tools | all (no restrictions) |
-| system_prompt | "You are the primary coordinator. Delegate tasks to specialists, synthesize results, make decisions." |
+| suggested_provider | anthropic |
+| suggested_model | claude-opus-4-6 |
+| tools | all |
+| system_prompt | "You are the primary coordinator. Delegate tasks, synthesize results, make decisions." |
 
 ### 2. Ops Monitor (L2)
-
-**For**: infrastructure monitoring, incident response.
 
 | Field | Default |
 |-------|---------|
 | trust_level | 2 |
 | role | monitor |
-| suggested_model | `claude-sonnet-4-6` or `deepseek-chat` |
-| tools | shell, http_request, memory_read, memory_write, IPC tools |
-| system_prompt | "You monitor infrastructure health. Run diagnostics, report incidents upstream, escalate destructive actions." |
+| suggested_provider | anthropic or deepseek |
+| suggested_model | claude-sonnet-4-6 |
+| tools | shell, http_request, memory_*, IPC tools |
+| system_prompt | "You monitor infrastructure. Run diagnostics, report incidents upstream, escalate destructive actions." |
 
 ### 3. Research Worker (L3)
-
-**For**: information gathering, browsing, analysis.
 
 | Field | Default |
 |-------|---------|
 | trust_level | 3 |
 | role | researcher |
-| suggested_model | `claude-sonnet-4-6` or `gpt-4o` |
-| tools | web_search, web_fetch, memory_read, memory_write, IPC tools |
-| system_prompt | "You research topics using web search and browsing. Return structured findings to the coordinator." |
+| suggested_provider | anthropic or openai |
+| suggested_model | claude-sonnet-4-6 |
+| tools | web_search, web_fetch, memory_*, IPC tools |
+| system_prompt | "You research topics using web search. Return structured findings to the coordinator." |
 
 ### 4. Code Worker (L3)
-
-**For**: development, code review, testing.
 
 | Field | Default |
 |-------|---------|
 | trust_level | 3 |
 | role | developer |
-| suggested_model | `claude-sonnet-4-6` or `deepseek-coder` |
-| tools | shell, file_read, file_write, memory_read, memory_write, IPC tools |
-| system_prompt | "You write, review, and test code. Work within the project workspace. Report results upstream." |
+| suggested_provider | anthropic or deepseek |
+| suggested_model | claude-sonnet-4-6 |
+| tools | shell, file_read, file_write, memory_*, IPC tools |
+| system_prompt | "You write, review, and test code. Work within the workspace. Report results upstream." |
 
 ### 5. Restricted Assistant (L4)
-
-**For**: children, guests, low-trust environments.
 
 | Field | Default |
 |-------|---------|
 | trust_level | 4 |
 | role | restricted |
-| suggested_model | `claude-haiku-4-5` or cheapest available |
-| tools | memory_read, web_search (filtered) |
-| system_prompt | "You are a friendly assistant. Answer questions, help with homework, tell stories. You cannot run commands or access files." |
+| suggested_provider | anthropic (haiku) or ollama |
+| suggested_model | claude-haiku-4-5 |
+| tools | memory_read, web_search |
+| system_prompt | "You are a friendly assistant. Answer questions, help with homework, tell stories. No commands, no files." |
 
 ---
 
 ## Fleet Blueprints (multi-agent)
 
-Each blueprint defines: which agent presets to deploy, their names, IPC wiring (lateral pairs, l4 destinations), and the coordinator's delegation prompt.
+Each blueprint defines: agent presets, names, suggested channels, IPC wiring.
+
+**Important**: the IPC wiring (lateral_text_pairs, l4_destinations) is generated as a **broker config patch snippet** that the operator manually adds to the broker's config.toml. This is a documented post-deploy step, not automated.
 
 ### Blueprint 1: Marketing Pipeline
 
-**Scenario**: automated content marketing — monitor news, aggregate trends, write copy, post to social.
+| Agent | Preset | Default name | Suggested channel |
+|-------|--------|-------------|-------------------|
+| Coordinator | L1 | `marketing-lead` | Telegram |
+| News Reader | L3 Research | `news-reader` | — |
+| Trend Aggregator | L3 Research | `trend-aggregator` | — |
+| Copywriter | L3 Code Worker | `copywriter` | — |
+| Publisher | L2 Ops Monitor | `publisher` | — |
 
-| Agent | Preset | Name | Channel | Notes |
-|-------|--------|------|---------|-------|
-| Coordinator | L1 Coordinator | `marketing-lead` | Telegram (operator) | Delegates, reviews drafts |
-| News Reader | L3 Research | `news-reader` | — | Reads RSS/web, sends findings |
-| Aggregator | L3 Research | `trend-aggregator` | — | Synthesizes from news-reader |
-| Copywriter | L3 Code Worker | `copywriter` | — | Writes threads/posts from aggregated data |
-| Publisher | L2 Ops Monitor | `publisher` | Webhook (social API) | Posts approved content |
+**Broker patch**:
+```toml
+[agents_ipc]
+lateral_text_pairs = [["news-reader", "trend-aggregator"]]
+```
 
-**IPC wiring**:
-- `lateral_text_pairs`: `[["news-reader", "trend-aggregator"], ["copywriter", "publisher"]]`
-- Flow: coordinator → task to news-reader → result → coordinator → task to aggregator → result → coordinator → task to copywriter → result → coordinator reviews → task to publisher
-
-**Coordinator prompt addition**: "You manage a content pipeline. Delegate news gathering to news-reader, trend analysis to trend-aggregator, copywriting to copywriter, and publishing to publisher. Review all content before publishing."
+**Flow**: coordinator delegates: news → aggregation → copywriting → review → publish.
 
 ### Blueprint 2: Office Assistant
 
-**Scenario**: email management, calendar, meeting prep, document drafting.
+| Agent | Preset | Default name | Suggested channel |
+|-------|--------|-------------|-------------------|
+| Coordinator | L1 | `office-lead` | Telegram or Slack |
+| Email Watcher | L3 Research | `email-watcher` | — |
+| Calendar Bot | L3 Research | `calendar-bot` | — |
+| Doc Writer | L3 Code Worker | `doc-writer` | — |
 
-| Agent | Preset | Name | Channel | Notes |
-|-------|--------|------|---------|-------|
-| Coordinator | L1 Coordinator | `office-lead` | Telegram/Slack (operator) | Central inbox, decisions |
-| Email Watcher | L3 Research | `email-watcher` | Email (IMAP) | Reads inbox, classifies, escalates |
-| Calendar Bot | L3 Research | `calendar-bot` | Webhook (calendar API) | Monitors events, sends reminders |
-| Doc Writer | L3 Code Worker | `doc-writer` | — | Drafts documents, presentations |
-| Responder | L2 Ops Monitor | `auto-responder` | Email (SMTP) | Sends approved replies |
+**Broker patch**:
+```toml
+[agents_ipc]
+lateral_text_pairs = []
+```
 
-**IPC wiring**:
-- `lateral_text_pairs`: `[["email-watcher", "auto-responder"]]`
-- Flow: email-watcher detects important mail → text to coordinator → coordinator decides → task to doc-writer or auto-responder
-
-**Coordinator prompt addition**: "You manage an office assistant team. email-watcher reads incoming mail and escalates important items to you. You decide what needs a response, a document, or a meeting reminder. Delegate accordingly."
+**Flow**: email-watcher/calendar-bot escalate to coordinator → coordinator delegates to doc-writer.
 
 ### Blueprint 3: Dev Team
 
-**Scenario**: code review, testing, deployment monitoring.
+| Agent | Preset | Default name | Suggested channel |
+|-------|--------|-------------|-------------------|
+| Coordinator | L1 | `dev-lead` | Slack or Discord |
+| Code Reviewer | L3 Code Worker | `reviewer` | — |
+| Test Runner | L3 Code Worker | `test-runner` | — |
+| Ops Monitor | L2 Ops Monitor | `ops` | — |
 
-| Agent | Preset | Name | Channel | Notes |
-|-------|--------|------|---------|-------|
-| Coordinator | L1 Coordinator | `dev-lead` | Slack/Discord (team) | Code decisions, PR reviews |
-| Code Reviewer | L3 Code Worker | `reviewer` | — | Reviews PRs, suggests changes |
-| Test Runner | L3 Code Worker | `test-runner` | — | Runs test suites, reports results |
-| Ops Monitor | L2 Ops Monitor | `ops` | Webhook (monitoring) | Watches deployments, alerts |
-
-**IPC wiring**:
-- `lateral_text_pairs`: `[["reviewer", "test-runner"], ["ops", "reviewer"]]`
-- Flow: webhook triggers ops → text to coordinator → coordinator → task to reviewer → result → task to test-runner → result → coordinator synthesizes
+**Broker patch**:
+```toml
+[agents_ipc]
+lateral_text_pairs = [["reviewer", "test-runner"], ["ops", "reviewer"]]
+```
 
 ### Blueprint 4: Family
 
-**Scenario**: home multi-agent system with children's restricted access.
+| Agent | Preset | Default name | Suggested channel |
+|-------|--------|-------------|-------------------|
+| Coordinator | L1 | `opus` | Telegram (parent) |
+| Daily Digest | L3 Research | `daily` | Telegram (family group) |
+| Kids Assistant | L4 Restricted | `kids` | Telegram (kids bot) |
+| Tutor | L4 Restricted | `tutor` | Telegram (tutor bot) |
 
-| Agent | Preset | Name | Channel | Notes |
-|-------|--------|------|---------|-------|
-| Coordinator | L1 Coordinator | `opus` | Telegram (parent) | Family brain |
-| Daily Digest | L3 Research | `daily` | Telegram (family group) | News, weather, reminders |
-| Kids Assistant | L4 Restricted | `kids` | Telegram (kids bot) | Homework help, stories |
-| Tutor | L4 Restricted | `tutor` | Telegram (tutor bot) | Educational Q&A |
+**Broker patch**:
+```toml
+[agents_ipc]
+lateral_text_pairs = []
 
-**IPC wiring**:
-- `l4_destinations`: `{"supervisor": "opus", "escalation": "opus"}`
-- `lateral_text_pairs`: `[]` (L4↔L4 forbidden by ACL)
-- Kids/tutor messages go to quarantine lane, reviewed by coordinator
-
-**Coordinator prompt addition**: "You manage a family assistant network. daily sends morning digests. kids and tutor serve the children — their messages arrive in the quarantine lane. Review quarantine content before acting on it."
+[agents_ipc.l4_destinations]
+supervisor = "opus"
+escalation = "opus"
+```
 
 ### Blueprint 5: Research Bureau
 
-**Scenario**: deep research with multiple specialized investigators.
+| Agent | Preset | Default name | Suggested channel |
+|-------|--------|-------------|-------------------|
+| Coordinator | L1 | `research-lead` | Telegram |
+| Web Researcher | L3 Research | `web-researcher` | — |
+| Analyst | L3 Research | `analyst` | — |
+| Report Writer | L3 Code Worker | `report-writer` | — |
 
-| Agent | Preset | Name | Channel | Notes |
-|-------|--------|------|---------|-------|
-| Coordinator | L1 Coordinator | `research-lead` | Telegram (operator) | Assigns topics, synthesizes |
-| Web Researcher | L3 Research | `web-researcher` | — | Broad web search |
-| Analyst | L3 Research | `analyst` | — | Deep analysis, fact-checking |
-| Report Writer | L3 Code Worker | `report-writer` | — | Structures findings into reports |
-
-**IPC wiring**:
-- `lateral_text_pairs`: `[["web-researcher", "analyst"]]`
-- Flow: coordinator → task to web-researcher → result → coordinator → task to analyst → result → coordinator → task to report-writer → final report
-
----
-
-## User Stories
-
-1. **"I want to add a single research agent."**
-   - Fleet → "Add Agent" → preset "Research Worker" → name "research" → pick provider + enter API key → optionally pick channel → Create → get pairing code + download config
-
-2. **"I want to deploy a marketing pipeline."**
-   - Fleet → "Deploy Blueprint" → "Marketing Pipeline" → enter provider API key (shared or per-agent) → enter channel tokens → Create All → download zip with 5 configs + see 5 pairing codes
-
-3. **"My kid needs a chat assistant."**
-   - Fleet → "Add Agent" → preset "Restricted Assistant" → name "kids" → pick cheap model (Haiku/DeepSeek) → enter Telegram bot token → Create → L4 agent, quarantine lane active
-
-4. **"I want to set up an office email assistant with Qwen on DashScope."**
-   - Fleet → "Deploy Blueprint" → "Office Assistant" → provider: `qwen-intl` → enter DashScope API key → email channel: enter IMAP/SMTP credentials → Create All
-
-5. **"I want to delete an agent."**
-   - Fleet → agent row → Actions → "Delete" → confirmation → revoked + hidden
-
-6. **"I want to use a local Ollama model, no API key."**
-   - Add Agent → provider: `ollama` → no API key field shown → enter Ollama base URL (default localhost:11434) → pick model name
+**Broker patch**:
+```toml
+[agents_ipc]
+lateral_text_pairs = [["web-researcher", "analyst"]]
+```
 
 ---
 
@@ -396,74 +322,33 @@ Each blueprint defines: which agent presets to deploy, their names, IPC wiring (
 
 ### 1. Add Agent Dialog (modal on Fleet page)
 
-**Trigger**: "Add Agent" button in Fleet header.
+**Step 1 — Preset**: 5 cards + "Custom" option.
 
-**Step 1 — Pick Preset**:
-- 5 agent preset cards in a grid: icon, name, trust badge, one-line description
-- Click to select → highlight
-- "Custom" option for manual config
+**Step 2 — Identity**: agent_id, role, trust level (pre-filled, editable with warning).
 
-**Step 2 — Identity**:
-- Agent ID (text input, lowercase, no spaces)
-- Role (pre-filled from preset, editable)
-- Trust level (pre-filled, dropdown L0-L4, warning if changed from preset)
+**Step 3 — Provider**: tier selector (Recommended / Local / Custom) → provider dropdown → credential fields (API key or "no key" for local) → model name → base URL override.
 
-**Step 3 — Provider**:
-- Tier selector (6 tiers as in Provider Catalog)
-- Provider dropdown (filtered by tier)
-- Credential fields (dynamic per provider — API key, or OAuth note, or "no key needed" for local)
-- Model name (pre-filled from preset, editable)
-- Base URL override (optional, shown for custom/local)
+**Step 4 — Channel** (optional): channel dropdown (messaging / work / none) → per-channel credential fields (verified against schema.rs) → WhatsApp shows Cloud/Web mode toggle → feature gate warnings for Matrix.
 
-**Step 4 — Channel (optional)**:
-- Channel dropdown (all from Channel Catalog, grouped by category)
-- Per-channel credential fields (dynamic)
-- Feature gate warning for Matrix/Nostr/WhatsApp-web
-- Gateway port (default auto-assigned)
-
-**Step 5 — Result**:
-- Pairing code (large, copyable)
-- "Download config.toml" button
-- Setup instructions (3 steps: place config → pair → start daemon)
-- "Done" → refresh Fleet
+**Step 5 — Result**: pairing code (large, copyable) + "Download config.toml" + setup instructions.
 
 ### 2. Deploy Blueprint Dialog (modal on Fleet page)
 
-**Trigger**: "Deploy Blueprint" button in Fleet header.
+**Step 1 — Blueprint**: 5 cards with topology description.
 
-**Step 1 — Pick Blueprint**:
-- 5 blueprint cards: icon, name, agent count, one-line description
-- Shows agent topology diagram (text-based: A → B → C)
+**Step 2 — Provider**: "Same for all" toggle → provider + key → per-agent model override.
 
-**Step 2 — Provider**:
-- "Same provider for all agents" toggle (default on)
-- If on: single provider + API key selection
-- If off: per-agent provider selection (tab per agent)
-- Model overrides per agent (pre-filled from preset)
+**Step 3 — Channels**: per-agent channel assignment from the same channel catalog.
 
-**Step 3 — Channels**:
-- Per-agent channel assignment
-- Pre-filled from blueprint (e.g., coordinator = Telegram, email-watcher = Email)
-- Credential fields per channel
+**Step 4 — Review**: summary table + broker config patch snippet (copyable).
 
-**Step 4 — Review**:
-- Summary table: agent_id, role, trust, provider, model, channel
-- Edit button per row (jumps back to relevant step)
-- Broker config additions: lateral_text_pairs, l4_destinations (shown read-only)
-
-**Step 5 — Result**:
-- All pairing codes in a table (copyable)
-- "Download All Configs (zip)" button
-- Per-agent "Download config.toml" buttons
-- Setup instructions per agent
-- "Done" → refresh Fleet
+**Step 5 — Result**: N pairing codes + "Download All (zip)" + broker patch snippet + per-agent setup instructions.
 
 ### 3. Fleet page updates
 
-- "Add Agent" button in header
-- "Deploy Blueprint" button in header
-- Filter toggle: "Show revoked" (default off)
+- "Add Agent" and "Deploy Blueprint" buttons in header
 - "Delete" action in agent row menu
+- "Show revoked" toggle (default off)
 
 ---
 
@@ -471,151 +356,49 @@ Each blueprint defines: which agent presets to deploy, their names, IPC wiring (
 
 ### Step 0: Provider & channel catalogs
 
-**Files**: `web/src/lib/ipc-providers.ts` (new), `web/src/lib/ipc-channels.ts` (new)
+**Files**: `web/src/lib/ipc-providers.ts`, `web/src/lib/ipc-channels.ts`
 
-**What**:
-- `ProviderTier` type, `PROVIDER_TIERS` array with all 6 tiers
-- `ProviderDef`: id, name, tier, credential_type (api_key | oauth | none), env_var, default_model, base_url
-- `PROVIDERS: ProviderDef[]` — full catalog (40+ providers)
-- `ChannelCategory` type, `CHANNEL_CATEGORIES` array
-- `ChannelDef`: id, name, category, fields (dynamic credential fields), feature_gate
-- `CHANNELS: ChannelDef[]` — full catalog (20+ channels)
-
-**Verify**: TypeScript compiles, catalog matches wizard.rs
-
----
+- Curated provider list (v1 scope: ~15 providers)
+- Channel definitions with correct field schemas from `schema.rs`
+- WhatsApp: single entry with cloud/web mode toggle
+- Feature gate metadata for Matrix
 
 ### Step 1: Agent presets & fleet blueprints
 
-**Files**: `web/src/lib/ipc-presets.ts` (new)
+**Files**: `web/src/lib/ipc-presets.ts`
 
-**What**:
-- `AgentPreset`: id, name, description, icon, trust_level, role, suggested_provider_tier, suggested_model, tools, system_prompt
-- `AGENT_PRESETS: AgentPreset[]` — 5 presets
-- `FleetBlueprint`: id, name, description, agents (array of { preset_id, default_name, default_channel }), lateral_text_pairs, l4_destinations, coordinator_prompt_addition
-- `FLEET_BLUEPRINTS: FleetBlueprint[]` — 5 blueprints
-
-**Verify**: TypeScript compiles
-
----
+- 5 agent presets + 5 fleet blueprints
+- Blueprint includes broker_patch_toml string
 
 ### Step 2: Config generator
 
-**Files**: `web/src/lib/ipc-config-gen.ts` (new)
+**Files**: `web/src/lib/ipc-config-gen.ts`
 
-**What**:
-- `AgentConfigInputs`: agentId, role, trustLevel, provider (id + apiKey + model + baseUrl), channel (id + credentials), brokerUrl, gatewayPort, systemPrompt
-- `generateAgentConfig(inputs: AgentConfigInputs): string` — produces valid TOML
-- `generateBlueprintConfigs(blueprint, sharedInputs, perAgentInputs): { name: string, config: string }[]` — produces configs for all agents in blueprint
-- `downloadAsFile(filename, content)` — Blob download helper
-- `downloadAsZip(files: {name, content}[])` — client-side zip (use JSZip or inline deflate)
-- Broker config additions (lateral pairs, l4 destinations) generated as a separate snippet
-
-**Verify**: `cd web && npm run build`
-
----
+- TOML generation from preset + user inputs
+- Blueprint: generates N configs + broker patch snippet
+- Blob download + zip (via JSZip or inline)
 
 ### Step 3: Add Agent dialog
 
-**Files**: `web/src/components/ipc/AddAgentDialog.tsx` (new)
+**Files**: `web/src/components/ipc/AddAgentDialog.tsx`
 
-**What**:
-- 5-step modal as described in Screens section
-- Dynamic provider fields based on tier/provider selection
-- Dynamic channel fields based on channel selection
-- Form validation per step
-- On final step: `createPaircode()` → show code + download config
-- Step indicator, back/next navigation, escape to close
-
-**Verify**: `cd web && npm run build`
-
----
+- 5-step modal, validated form, pairing code generation
 
 ### Step 4: Deploy Blueprint dialog
 
-**Files**: `web/src/components/ipc/DeployBlueprintDialog.tsx` (new)
+**Files**: `web/src/components/ipc/DeployBlueprintDialog.tsx`
 
-**What**:
-- 5-step modal as described in Screens section
-- Topology visualization (text diagram)
-- Shared vs per-agent provider toggle
-- Per-agent channel assignment
-- Review table with inline edit
-- On final step: batch `createPaircode()` for each agent → show all codes + download zip
+- 5-step modal, batch pairing, zip download, broker patch display
 
-**Verify**: `cd web && npm run build`
-
----
-
-### Step 5: Wire into Fleet page + API
+### Step 5: Wire into Fleet page
 
 **Files**: `web/src/pages/ipc/Fleet.tsx`, `web/src/lib/ipc-api.ts`
 
-**What**:
-- `createPaircode()` in API client
-- "Add Agent" and "Deploy Blueprint" buttons in Fleet header
-- Dialog open/close state for both
-- "Delete" action in agent row (= revokeAgent + hide)
-- "Show revoked" toggle filter
-- Refresh Fleet after provisioning
-
-**Verify**: `cd web && npm run build`, manual browser test
-
----
+- Buttons, dialogs, delete action, revoked filter
 
 ### Step 6: Polish + docs
 
-**What**:
-- Copy-to-clipboard for all pairing codes
-- Trust level tooltips (L0-L4 explanation)
-- Provider help links (where to get API key)
-- Channel setup hints (how to create a Telegram bot, etc.)
-- Feature gate warnings (Matrix requires `--features channel-matrix`)
-- Update `ipc-quickstart.md` with UI provisioning flow
-- Update `delta-registry.md`
-
-**Verify**: full walkthrough: single agent add + blueprint deploy + delete
-
----
-
-## File Structure
-
-```
-web/src/
-├── lib/
-│   ├── ipc-providers.ts         # NEW: provider catalog (40+ providers)
-│   ├── ipc-channels.ts          # NEW: channel catalog (20+ channels)
-│   ├── ipc-presets.ts           # NEW: 5 agent presets + 5 fleet blueprints
-│   ├── ipc-config-gen.ts        # NEW: TOML generator + zip download
-│   └── ipc-api.ts               # EDIT: add createPaircode()
-├── components/
-│   └── ipc/
-│       ├── AddAgentDialog.tsx    # NEW: single agent provisioning (5 steps)
-│       └── DeployBlueprintDialog.tsx # NEW: fleet provisioning (5 steps)
-└── pages/
-    └── ipc/
-        └── Fleet.tsx             # EDIT: add buttons + dialogs + delete + filter
-```
-
----
-
-## Verification
-
-### Final checklist
-1. "Add Agent" button visible on Fleet page
-2. All 5 agent presets render with correct defaults
-3. All 40+ providers available in tier-grouped dropdown
-4. Provider credential fields change dynamically (API key / OAuth / none)
-5. All 20+ channels available with correct credential fields
-6. Feature gate warnings shown for Matrix, Nostr, WhatsApp-web
-7. Config.toml downloads with valid TOML structure
-8. "Deploy Blueprint" shows 5 blueprints with topology diagrams
-9. Blueprint creates N pairing codes and downloads N configs as zip
-10. Pairing code copyable with one click
-11. Downloaded config works: agent starts, pairs, appears in Fleet
-12. "Delete" action revokes and hides agent
-13. "Show revoked" toggle works
-14. API keys never sent to broker (client-side generation only)
+- Copy-to-clipboard, tooltips, help links, quickstart update
 
 ---
 
@@ -623,12 +406,24 @@ web/src/
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| API key leaked to broker | Credential compromise | AD-1: config generated client-side only |
-| Invalid TOML generated | Agent won't start | Template-based generation, test each preset |
-| Blueprint topology doesn't match real use case | Misleading defaults | Clear description, editable fields, "Custom" option |
-| Provider catalog drifts from wizard.rs | Config incompatibility | AD-3: mirror wizard exactly, review on upstream sync |
-| Zip generation fails in browser | No bundle download | Fallback: individual file downloads |
-| Scope creep into remote deployment | Delays delivery | Non-goal, documented |
+| API key leaked to broker | Credential compromise | AD-1: client-side generation only |
+| Invalid TOML generated | Agent won't start | Fields verified against schema.rs |
+| Channel fields drift from schema | Broken configs | AD-5: curated v1 subset, review on sync |
+| Provider catalog drifts from wizard | Incompatible configs | AD-4: curated subset, Custom fallback |
+| Blueprint broker patch forgotten | IPC wiring broken | Explicit "copy this to broker config" step with warning |
+| Scope creep | Delays delivery | Non-goals documented, v2 boundary clear |
+
+---
+
+## v1 vs v2 boundary
+
+| Feature | v1 (this phase) | v2 (future) |
+|---------|----------------|-------------|
+| Providers | Tier 1 + Local + Custom (~15) | All 40+ tiers |
+| Channels | 15 agent-facing transports | + webhook, mqtt, nostr, linq |
+| Blueprint wiring | Broker patch snippet (manual) | Live broker config API |
+| Custom blueprints | — | User-defined blueprint builder |
+| Provider sync | Manual review on upstream sync | Auto-generation from wizard.rs |
 
 ---
 
@@ -642,17 +437,5 @@ web/src/
 - New Rust backend code (all frontend-only)
 - Phase 4 (federated execution)
 
-**Optional enhancement**:
-- JSZip or similar for client-side zip generation (blueprint download)
-
----
-
-## What's NOT in Phase 3.6
-
-- Remote deployment / SSH provisioning
-- Config sync between broker and agents
-- Custom blueprint builder UI (ship static blueprints first)
-- Visual TOML editor for all fields
-- Agent auto-discovery on LAN
-- Provider credential management on broker side
-- Real-time blueprint topology visualization (graph/canvas)
+**Optional**:
+- JSZip for client-side zip (blueprint download)
