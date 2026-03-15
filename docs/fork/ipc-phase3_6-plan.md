@@ -132,20 +132,20 @@ Agent-facing bidirectional transports only. Fields verified against `schema.rs`.
 | `mattermost` | Mattermost | `url`, `bot_token`, `allowed_users` | `channel_id`, `thread_replies`, `mention_only` |
 | `matrix` | Matrix | `homeserver`, `room_id`, `allowed_users` | `access_token` or `password`+`user_id`, `device_id` |
 | `signal` | Signal | `http_url`, `account` | `group_id`, `allowed_from`, `ignore_attachments` |
-| `whatsapp` | WhatsApp (Cloud) | `access_token`, `phone_number_id`, `allowed_numbers` | `verify_token`, `app_secret` |
+| `whatsapp` | WhatsApp (Cloud) | `access_token`, `phone_number_id`, `verify_token`, `allowed_numbers` | `app_secret` |
 | `whatsapp` (web mode) | WhatsApp (Web) | `session_path`, `allowed_numbers` | `pair_phone`, `pair_code` |
 | `imessage` | iMessage | `allowed_contacts` | — (macOS only) |
-| `irc` | IRC | `server`, `nick`, `channel` | `port`, `password`, `use_tls` |
+| `irc` | IRC | `server`, `nickname`, `channels` | `port`, `username`, `allowed_users`, `server_password`, `nickserv_password`, `sasl_password`, `verify_tls` |
 
 ### Work / Enterprise
 
 | ID | Name | Required fields | Optional fields |
 |----|------|----------------|-----------------|
 | `lark` | Lark / Feishu | `app_id`, `app_secret` | `verification_token`, `encrypt_key` |
-| `dingtalk` | DingTalk | `app_key`, `app_secret`, `robot_code` | `allowed_users` |
+| `dingtalk` | DingTalk | `client_id`, `client_secret` | `allowed_users` |
 | `wecom` | WeCom | `webhook_key` | `allowed_users` |
 | `qq` | QQ Official | `app_id`, `app_secret` | `allowed_users` |
-| `nextcloud_talk` | Nextcloud Talk | `url`, `token`, `room_token` | `allowed_users` |
+| `nextcloud_talk` | Nextcloud Talk | `base_url`, `app_token` | `webhook_secret`, `allowed_users` |
 
 ### Feature-gated
 
