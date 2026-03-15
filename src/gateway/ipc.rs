@@ -135,6 +135,11 @@ impl IpcDb {
                 last_seq INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS sender_sequences (
+                agent_id         TEXT PRIMARY KEY,
+                last_sender_seq  INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS spawn_runs (
                 id           TEXT PRIMARY KEY,
                 parent_id    TEXT NOT NULL,
@@ -690,6 +695,29 @@ impl IpcDb {
         .flatten()
     }
 
+    // ── Phase 3B Step 10: Sender-side replay protection ────────────
+
+    /// Get the last seen sender-side sequence number for an agent.
+    pub fn get_last_sender_seq(&self, agent_id: &str) -> i64 {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT last_sender_seq FROM sender_sequences WHERE agent_id = ?1",
+            params![agent_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Update the last seen sender-side sequence number for an agent.
+    pub fn set_last_sender_seq(&self, agent_id: &str, seq: i64) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "INSERT INTO sender_sequences (agent_id, last_sender_seq) VALUES (?1, ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET last_sender_seq = ?2",
+            params![agent_id, seq],
+        );
+    }
+
     /// Check sequence integrity: seq must be strictly greater than the last
     /// seq for this sender-receiver pair. Shared by all insert paths.
     fn check_seq_integrity(
@@ -788,10 +816,16 @@ pub struct SendBody {
     pub session_id: Option<String>,
     #[serde(default)]
     pub priority: i32,
-    /// Ed25519 signature over `{from}|{to}|{seq}|{sha256(payload)}` (Phase 3B).
+    /// Ed25519 signature over `{from}|{to}|{seq}|{timestamp}|{sha256(payload)}` (Phase 3B).
     /// Optional — broker verifies only when agent has a registered public key.
     #[serde(default)]
     pub signature: Option<String>,
+    /// Sender-side monotonic sequence number for replay protection (Phase 3B Step 10).
+    #[serde(default)]
+    pub sender_seq: Option<i64>,
+    /// Sender-side timestamp (unix seconds) for replay window check.
+    #[serde(default)]
+    pub sender_timestamp: Option<i64>,
 }
 
 fn default_kind() -> String {
@@ -1458,62 +1492,102 @@ pub async fn handle_ipc_send(
         }
     }
 
-    // ── Phase 3B: Ed25519 signature verification ──────────────────
-    // If the sender has a registered public key, verify the signature.
+    // ── Phase 3B: Ed25519 signature + replay protection ────────────
+    // If the sender has a registered public key, verify signature + seq + timestamp.
     // If no public key is registered, signature is not required (backward compat).
-    // If a signature is provided but invalid, the message is rejected.
     if let Some(ref pubkey_hex) = db.get_agent_public_key(&meta.agent_id) {
-        match &body.signature {
-            Some(sig) => {
-                use sha2::{Digest, Sha256};
-                let payload_hash = hex::encode(Sha256::digest(body.payload.as_bytes()));
-                let signing_data = format!("{}|{}|{}", meta.agent_id, resolved_to, payload_hash);
-                if let Err(e) = crate::security::identity::verify_signature(
-                    pubkey_hex,
-                    signing_data.as_bytes(),
-                    sig,
-                ) {
-                    if let Some(ref logger) = state.audit_logger {
-                        let mut event = AuditEvent::ipc(
-                            AuditEventType::IpcBlocked,
-                            &meta.agent_id,
-                            Some(&resolved_to),
-                            &format!("signature_invalid: {e}"),
-                        );
-                        if let Some(a) = event.action.as_mut() {
-                            a.allowed = false;
-                        }
-                        let _ = logger.log(&event);
-                    }
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({
-                            "error": "Invalid message signature",
-                            "code": "signature_invalid",
-                            "retryable": false
-                        })),
-                    ));
-                }
-            }
-            None => {
-                // Agent has a registered key but didn't sign — reject
-                if let Some(ref logger) = state.audit_logger {
-                    let mut event = AuditEvent::ipc(
-                        AuditEventType::IpcBlocked,
+        let (sig, sender_seq, sender_ts) = match (
+            &body.signature,
+            body.sender_seq,
+            body.sender_timestamp,
+        ) {
+            (Some(sig), Some(seq), Some(ts)) => (sig.clone(), seq, ts),
+            _ => {
+                emit_blocked_audit(
+                        &state,
                         &meta.agent_id,
-                        Some(&resolved_to),
-                        "signature_missing: agent has registered key but message is unsigned",
+                        &resolved_to,
+                        "signature_missing: agent has registered key but message lacks signature/seq/timestamp",
                     );
-                    if let Some(a) = event.action.as_mut() {
-                        a.allowed = false;
-                    }
-                    let _ = logger.log(&event);
-                }
                 return Err((
                     StatusCode::FORBIDDEN,
                     Json(serde_json::json!({
-                        "error": "Message signature required (agent has registered public key)",
+                        "error": "Message signature, sender_seq, and sender_timestamp required",
                         "code": "signature_missing",
+                        "retryable": false
+                    })),
+                ));
+            }
+        };
+
+        // 1. Verify signature over {from}|{to}|{seq}|{timestamp}|{sha256(payload)}
+        {
+            use sha2::{Digest, Sha256};
+            let payload_hash = hex::encode(Sha256::digest(body.payload.as_bytes()));
+            let signing_data = format!(
+                "{}|{}|{}|{}|{}",
+                meta.agent_id, resolved_to, sender_seq, sender_ts, payload_hash
+            );
+            if let Err(e) = crate::security::identity::verify_signature(
+                pubkey_hex,
+                signing_data.as_bytes(),
+                &sig,
+            ) {
+                emit_blocked_audit(
+                    &state,
+                    &meta.agent_id,
+                    &resolved_to,
+                    &format!("signature_invalid: {e}"),
+                );
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Invalid message signature",
+                        "code": "signature_invalid",
+                        "retryable": false
+                    })),
+                ));
+            }
+        }
+
+        // 2. Replay protection: sender_seq must be > last_seen_sender_seq
+        {
+            let last_seq = db.get_last_sender_seq(&meta.agent_id);
+            if sender_seq <= last_seq {
+                emit_blocked_audit(
+                    &state,
+                    &meta.agent_id,
+                    &resolved_to,
+                    &format!("replay_rejected: sender_seq={sender_seq} <= last_seen={last_seq}"),
+                );
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Replayed message rejected (sequence already seen)",
+                        "code": "replay_rejected",
+                        "retryable": false
+                    })),
+                ));
+            }
+            db.set_last_sender_seq(&meta.agent_id, sender_seq);
+        }
+
+        // 3. Timestamp window: reject messages older than 5 minutes
+        {
+            let now = unix_now();
+            let drift = (now - sender_ts).abs();
+            if drift > 300 {
+                emit_blocked_audit(
+                    &state,
+                    &meta.agent_id,
+                    &resolved_to,
+                    &format!("timestamp_expired: drift={drift}s (max 300s)"),
+                );
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Message timestamp outside acceptable window (5 min)",
+                        "code": "timestamp_expired",
                         "retryable": false
                     })),
                 ));
@@ -2350,6 +2424,17 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Emit a blocked audit event (DRY helper for signature/replay/timestamp checks).
+fn emit_blocked_audit(state: &AppState, from: &str, to: &str, detail: &str) {
+    if let Some(ref logger) = state.audit_logger {
+        let mut event = AuditEvent::ipc(AuditEventType::IpcBlocked, from, Some(to), detail);
+        if let Some(a) = event.action.as_mut() {
+            a.allowed = false;
+        }
+        let _ = logger.log(&event);
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -3823,5 +3908,51 @@ mod tests {
 
         client.sign_send_body(&mut body);
         assert!(body["signature"].is_null());
+    }
+
+    // ── Phase 3B Step 10: Replay protection tests ───────────────
+
+    #[test]
+    fn sender_seq_tracking() {
+        let db = IpcDb::open_in_memory().unwrap();
+
+        assert_eq!(db.get_last_sender_seq("opus"), 0);
+
+        db.set_last_sender_seq("opus", 5);
+        assert_eq!(db.get_last_sender_seq("opus"), 5);
+
+        db.set_last_sender_seq("opus", 10);
+        assert_eq!(db.get_last_sender_seq("opus"), 10);
+
+        // Different agent has independent counter
+        assert_eq!(db.get_last_sender_seq("sentinel"), 0);
+    }
+
+    #[test]
+    fn ipc_client_sign_includes_seq_and_timestamp() {
+        use crate::tools::agents_ipc::IpcClient;
+
+        let identity = crate::security::identity::AgentIdentity::generate().unwrap();
+        let client = IpcClient::new("http://localhost:42617", "token", 10)
+            .with_identity(identity, "opus".into());
+
+        let mut body = serde_json::json!({
+            "to": "sentinel",
+            "kind": "text",
+            "payload": "hello",
+        });
+
+        client.sign_send_body(&mut body);
+        assert!(body["signature"].is_string());
+        assert!(body["sender_seq"].is_number());
+        assert!(body["sender_timestamp"].is_number());
+        assert_eq!(body["sender_seq"].as_i64().unwrap(), 1);
+
+        // Second call increments seq
+        let mut body2 = body.clone();
+        body2["signature"] = serde_json::json!(null);
+        body2["sender_seq"] = serde_json::json!(null);
+        client.sign_send_body(&mut body2);
+        assert_eq!(body2["sender_seq"].as_i64().unwrap(), 2);
     }
 }

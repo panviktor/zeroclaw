@@ -23,6 +23,8 @@ pub struct IpcClient {
     identity: Option<crate::security::identity::AgentIdentity>,
     /// Agent ID for signing context.
     agent_id: Option<String>,
+    /// Monotonic sender-side sequence counter for replay protection (Phase 3B Step 10).
+    sender_seq: std::sync::atomic::AtomicI64,
 }
 
 impl IpcClient {
@@ -42,6 +44,7 @@ impl IpcClient {
             bearer_token: bearer_token.to_string(),
             identity: None,
             agent_id: None,
+            sender_seq: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -56,17 +59,33 @@ impl IpcClient {
         self
     }
 
+    /// Get the next sender-side sequence number (monotonically increasing).
+    fn next_sender_seq(&self) -> i64 {
+        self.sender_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
     /// Sign a send body if identity is available.
-    /// Adds `signature` field to the JSON body in-place.
+    /// Adds `signature`, `sender_seq`, and `sender_timestamp` fields to the JSON body.
     pub fn sign_send_body(&self, body: &mut serde_json::Value) {
         if let (Some(ref identity), Some(ref from_agent)) = (&self.identity, &self.agent_id) {
             let to = body["to"].as_str().unwrap_or("");
             let payload = body["payload"].as_str().unwrap_or("");
+            let seq = self.next_sender_seq();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
             use sha2::{Digest, Sha256};
             let payload_hash = hex::encode(Sha256::digest(payload.as_bytes()));
-            let signing_data = format!("{from_agent}|{to}|{payload_hash}");
+            let signing_data = format!("{from_agent}|{to}|{seq}|{timestamp}|{payload_hash}");
             let sig = identity.sign(signing_data.as_bytes());
+
             body["signature"] = serde_json::json!(sig);
+            body["sender_seq"] = serde_json::json!(seq);
+            body["sender_timestamp"] = serde_json::json!(timestamp);
         }
     }
 
