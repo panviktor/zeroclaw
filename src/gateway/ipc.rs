@@ -4899,7 +4899,7 @@ mod tests {
         // Check it's now blocked with reason 'dismissed'
         let _msg = db.get_message(msg_id).unwrap();
         // dismissed messages have blocked=1 in the DB (StoredMessage doesn't expose it)
-                                   // Verify via admin listing
+        // Verify via admin listing
         let dismissed =
             db.list_messages_admin(None, None, None, None, Some(true), None, None, None, 50, 0);
         assert_eq!(dismissed.len(), 1);
