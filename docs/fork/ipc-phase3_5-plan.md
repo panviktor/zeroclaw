@@ -46,13 +46,23 @@ With Phase 3.5:
 
 ## Architectural Decisions
 
-### AD-1: Extend existing web UI, don't replace it
+### AD-1: Extend existing web UI, localhost-only access model
 
-The gateway already serves a React 19 + Vite + Tailwind SPA via `rust-embed`. 10 pages exist. Phase 3.5 adds a new "IPC" sidebar section with 6 pages. Same auth (bearer token), same API patterns (`apiFetch`), same design system (glass-card, electric theme).
+The gateway already serves a React 19 + Vite + Tailwind SPA via `rust-embed`. 10 pages exist. Phase 3.5 adds a new "IPC" sidebar section with 6 pages. Same design system (glass-card, electric theme), same API patterns (`apiFetch`).
 
-**Why**: building a separate admin UI doubles maintenance. The existing SPA framework, auth flow, and design tokens are sufficient. Adding pages is cheaper than adding infrastructure.
+**Access model**: Phase 3.5 IPC admin pages work **only when the browser connects to localhost** (or via SSH tunnel / reverse proxy to localhost). This matches the existing `/admin/ipc/*` security model where every handler calls `require_localhost(&peer)` before processing — there is **no bearer token check** on admin endpoints, only peer address validation.
 
-**Consequence**: all IPC admin pages share the same auth token as the chat UI. Localhost-only enforcement is on the backend, not the frontend. The frontend calls `/admin/ipc/*` endpoints — the backend rejects if not localhost.
+The frontend uses `apiFetch()` which sends the bearer token, but the backend admin handlers ignore it — they enforce localhost origin only. This is intentional: admin operations (revoke, quarantine, etc.) are too sensitive for bearer-only auth. A leaked gateway token should not grant admin access.
+
+**Deployment contract**:
+- **Local development**: browser at `http://localhost:{port}` → works directly
+- **Remote server**: SSH tunnel (`ssh -L 8080:localhost:{port} server`) → browser at `http://localhost:8080` → works
+- **Reverse proxy**: nginx/caddy on the server forwarding to localhost → admin endpoints require `trust_forwarded_headers` or direct localhost binding
+- **Public internet**: admin endpoints return 403 regardless of auth token
+
+**Why**: building a separate admin auth model (admin tokens, RBAC, session management) is significant scope. The localhost-only model is already proven in the codebase and sufficient for the target deployment (family multi-agent system on a home server).
+
+**Consequence**: the frontend conditionally shows IPC admin pages — if `/admin/ipc/agents` returns 403, the IPC sidebar section is hidden with a tooltip "Admin pages require localhost access".
 
 ### AD-2: Read endpoints are side-effect-free
 
@@ -191,7 +201,7 @@ CREATE TABLE spawn_runs (
 4. **"After an incident, I trace a suspicious message back to its origin."**
    - Operator opens `/ipc/sessions` → filters by session_id from the incident
    - Sees full message timeline: who sent what, trust levels, which were blocked
-   - Clicks message → sees signature status, seq number, delivery lane
+   - Clicks message → sees seq number, delivery lane, trust levels
    - Jumps to agent detail → sees spawn history, trust changes
 
 5. **"I verify the audit chain hasn't been tampered with."**
@@ -322,13 +332,14 @@ Sees success toast                │
 | kind | Color badge: task=blue, query=purple, result=green, text=gray |
 | lane | normal=none, quarantine=orange dot, blocked=red dot |
 | seq | Mono font, small |
-| signature | Icon: check (verified), x (failed), dash (unsigned) |
 | payload | First 200 chars, click to expand |
+
+**Note on signatures**: The broker verifies Ed25519 signatures on message receipt but does **not persist** signature data or verification results in the messages table. Historical messages cannot show "verified/unsigned/failed" status without a schema migration. Phase 3.5 v1 does not add signature columns — if provenance per-message is needed in the UI, a future step should add `signature_verified BOOLEAN` column to the messages table and populate it at INSERT time.
 
 **Expand** (click row):
 - Full payload (redacted by default, raw toggle)
 - Metadata: session_id, priority, blocked_reason, promoted flag
-- Signature details: signing data, public key reference
+- Sender's public key status (from agents table: registered / not registered)
 - Links: jump to from-agent detail, to-agent detail, parent spawn
 
 **Pagination**: 50 per page, load more.
@@ -368,7 +379,7 @@ Sees success toast                │
 
 **Purpose**: Operator review queue for L4+ messages. Separate from normal flow.
 
-**Data source**: `GET /admin/ipc/messages?quarantine=true&read=0` (new endpoint)
+**Data source**: `GET /admin/ipc/messages?quarantine=true&dismissed=false` (new endpoint)
 
 **Queue display**:
 
@@ -433,9 +444,15 @@ Sees success toast                │
 
 **What**:
 - Add `IpcDb::list_messages_admin()` — paginated, filterable query:
-  - Params: agent_id, session_id, kind, quarantine (bool), limit, offset
+  - Params: agent_id, session_id, kind, quarantine (bool), dismissed (bool), limit, offset
   - Does NOT set `read=1` or update `last_seen`
-  - Returns messages with computed fields: lane (normal/quarantine/blocked), signature_status
+  - Returns messages with computed field: lane (normal/quarantine/blocked)
+  - **Quarantine queue contract**: a message is in the quarantine lane when `from_trust_level >= 4`. Within quarantine:
+    - **pending** = `promoted=0 AND blocked=0` (not yet reviewed)
+    - **promoted** = `promoted=1` (delivered to target inbox via `/admin/ipc/promote`)
+    - **dismissed** = `blocked=1 AND blocked_reason='dismissed'` (reviewed but not delivered via `/admin/ipc/dismiss-message`)
+  - Filter `dismissed=false` returns pending + promoted (excluding dismissed). Default for Quarantine Review page.
+  - Filter `dismissed=true` returns only dismissed items (for audit trail)
 - Add `IpcDb::list_spawn_runs_admin()` — paginated, filterable:
   - Params: status, parent_id, limit, offset
 - Add `IpcDb::agent_detail()` — single agent + recent messages + active spawn runs
@@ -547,7 +564,7 @@ Sees success toast                │
 - `StatusBadge.tsx` — agent status badge (online=green, disabled=gray, revoked=red, quarantined=orange, ephemeral=purple)
 - `KindBadge.tsx` — message kind badge (task=blue, query=purple, result=green, text=gray)
 - `LaneDot.tsx` — delivery lane indicator (normal=none, quarantine=orange, blocked=red)
-- `SignatureIcon.tsx` — verified/unsigned/failed icon
+- `KeyStatusIcon.tsx` — agent has registered public key or not (from agents table)
 - `ConfirmDialog.tsx` — reusable confirmation modal for destructive actions
 - `MessageDetail.tsx` — expandable message view with redacted/raw toggle
 - `TimeAgo.tsx` — relative timestamp component ("3m ago", "2h ago")
@@ -632,7 +649,7 @@ These components are shared across all IPC pages for consistent rendering.
 **Files**: `web/src/pages/ipc/Quarantine.tsx`
 
 **What**:
-- Fetches `GET /admin/ipc/messages?quarantine=true&blocked=0`
+- Fetches `GET /admin/ipc/messages?quarantine=true&dismissed=false`
 - Queue display with all columns from Screen 5 spec
 - Payload **redacted by default** (first 200 chars of sanitized text)
 - "Inspect" button → modal with full payload + raw toggle
@@ -702,7 +719,7 @@ web/src/
 │       ├── StatusBadge.tsx
 │       ├── KindBadge.tsx
 │       ├── LaneDot.tsx
-│       ├── SignatureIcon.tsx
+│       ├── KeyStatusIcon.tsx
 │       ├── ConfirmDialog.tsx
 │       ├── MessageDetail.tsx
 │       ├── TimeAgo.tsx
