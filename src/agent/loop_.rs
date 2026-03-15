@@ -2968,28 +2968,51 @@ pub async fn run(
     // ── Phase 3A: Ephemeral agent tool allowlist enforcement ─────
     // When ZEROCLAW_ALLOWED_TOOLS is set, hard-filter the registry to only
     // those tools. This is a security boundary — not just a hint.
-    if let Ok(allowed_str) = std::env::var("ZEROCLAW_ALLOWED_TOOLS") {
-        let allowed_str = allowed_str.trim();
-        if !allowed_str.is_empty() {
-            let allowed: std::collections::HashSet<&str> = allowed_str
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            let before = tools_registry.len();
-            tools_registry.retain(|tool| allowed.contains(tool.name()));
-            tracing::info!(
-                before = before,
-                after = tools_registry.len(),
-                allowed = %allowed_str,
-                "IPC enforcement: tool allowlist applied"
-            );
-            if tools_registry.is_empty() {
-                anyhow::bail!(
-                    "ZEROCLAW_ALLOWED_TOOLS={allowed_str} filtered out all tools — \
-                     child agent cannot function. Check workload profile configuration."
+    //
+    // IMPORTANT: this filter must also cover delegate_handle and suppress
+    // MCP injection to be a true security boundary. An ephemeral child
+    // with an allowlist must not gain tools via MCP or delegate bypass.
+    let ephemeral_allowlist: Option<std::collections::HashSet<String>> =
+        std::env::var("ZEROCLAW_ALLOWED_TOOLS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            });
+
+    if let Some(ref allowed) = ephemeral_allowlist {
+        // 1. Filter the main tool registry
+        let before = tools_registry.len();
+        tools_registry.retain(|tool| allowed.contains(tool.name()));
+        tracing::info!(
+            before = before,
+            after = tools_registry.len(),
+            allowed = ?allowed,
+            "IPC enforcement: tool allowlist applied to registry"
+        );
+
+        // 2. Filter delegate_handle so delegate cannot bypass the allowlist
+        if let Some(ref handle) = delegate_handle {
+            let mut parent_tools = handle.write();
+            let parent_before = parent_tools.len();
+            parent_tools.retain(|tool| allowed.contains(tool.name()));
+            if parent_before != parent_tools.len() {
+                tracing::info!(
+                    before = parent_before,
+                    after = parent_tools.len(),
+                    "IPC enforcement: tool allowlist applied to delegate parent_tools"
                 );
             }
+        }
+
+        if tools_registry.is_empty() {
+            anyhow::bail!(
+                "ZEROCLAW_ALLOWED_TOOLS filtered out all tools — \
+                 child agent cannot function. Check workload profile configuration."
+            );
         }
     }
 
@@ -3000,11 +3023,14 @@ pub async fn run(
     // filter is not appropriate for them and would silently drop all MCP tools when
     // a restrictive allowlist is configured. Keep this block after any such filter call.
     //
+    // SECURITY: When ZEROCLAW_ALLOWED_TOOLS is set (ephemeral agent), MCP is
+    // completely suppressed to prevent allowlist bypass via external tool servers.
+    //
     // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
     // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
     // fetch schemas on demand. This reduces context window waste.
     let mut deferred_section = String::new();
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+    if config.mcp.enabled && !config.mcp.servers.is_empty() && ephemeral_allowlist.is_none() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
             config.mcp.servers.len()
