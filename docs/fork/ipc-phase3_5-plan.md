@@ -57,8 +57,7 @@ The frontend uses `apiFetch()` which sends the bearer token, but the backend adm
 **Deployment contract**:
 - **Local development**: browser at `http://localhost:{port}` → works directly
 - **Remote server**: SSH tunnel (`ssh -L 8080:localhost:{port} server`) → browser at `http://localhost:8080` → works
-- **Reverse proxy**: nginx/caddy on the server forwarding to localhost → admin endpoints require `trust_forwarded_headers` or direct localhost binding
-- **Public internet**: admin endpoints return 403 regardless of auth token
+- **Public internet / reverse proxy**: admin endpoints return 403 — `require_localhost()` checks `peer.ip().is_loopback()` and does **not** honor forwarded headers
 
 **Why**: building a separate admin auth model (admin tokens, RBAC, session management) is significant scope. The localhost-only model is already proven in the codebase and sufficient for the target deployment (family multi-agent system on a home server).
 
@@ -68,7 +67,7 @@ The frontend uses `apiFetch()` which sends the bearer token, but the backend adm
 
 Viewing messages, agents, or audit events in the UI **must not** change state. No `read=1` flag set on view, no `last_seen` updated from admin browsing, no implicit acknowledgment.
 
-**Why**: the existing `GET /api/ipc/inbox` has consumptive semantics (optional `read=1` param). Admin read endpoints use separate query methods that don't modify message state.
+**Why**: the existing `GET /api/ipc/inbox` has consumptive semantics — `fetch_inbox()` automatically marks messages as read on retrieval. Admin read endpoints use separate query methods that don't modify message state.
 
 **Consequence**: admin message listing uses `db.list_messages_admin()` (new), not `db.fetch_inbox()` (existing). Agent `last_seen` is updated only by agent API calls, not admin views.
 
@@ -151,7 +150,7 @@ CREATE TABLE messages (
     payload         TEXT NOT NULL,
     from_trust_level INTEGER NOT NULL DEFAULT 0,
     session_id      TEXT,
-    priority        TEXT DEFAULT 'normal',
+    priority        INTEGER DEFAULT 0,
     read            INTEGER NOT NULL DEFAULT 0,
     promoted        INTEGER NOT NULL DEFAULT 0,
     blocked         INTEGER NOT NULL DEFAULT 0,
@@ -509,7 +508,7 @@ Sees success toast                │
     payload: string;
     from_trust_level: number;
     session_id: string | null;
-    priority: string;
+    priority: number;
     read: boolean;
     promoted: boolean;
     blocked: boolean;
