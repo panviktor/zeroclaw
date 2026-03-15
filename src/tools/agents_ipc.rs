@@ -19,6 +19,10 @@ pub struct IpcClient {
     client: reqwest::Client,
     broker_url: String,
     bearer_token: String,
+    /// Optional Ed25519 identity for message signing (Phase 3B).
+    identity: Option<crate::security::identity::AgentIdentity>,
+    /// Agent ID for signing context.
+    agent_id: Option<String>,
 }
 
 impl IpcClient {
@@ -36,6 +40,33 @@ impl IpcClient {
             client,
             broker_url: broker_url.trim_end_matches('/').to_string(),
             bearer_token: bearer_token.to_string(),
+            identity: None,
+            agent_id: None,
+        }
+    }
+
+    /// Attach an Ed25519 identity for message signing.
+    pub fn with_identity(
+        mut self,
+        identity: crate::security::identity::AgentIdentity,
+        agent_id: String,
+    ) -> Self {
+        self.identity = Some(identity);
+        self.agent_id = Some(agent_id);
+        self
+    }
+
+    /// Sign a send body if identity is available.
+    /// Adds `signature` field to the JSON body in-place.
+    pub fn sign_send_body(&self, body: &mut serde_json::Value) {
+        if let (Some(ref identity), Some(ref from_agent)) = (&self.identity, &self.agent_id) {
+            let to = body["to"].as_str().unwrap_or("");
+            let payload = body["payload"].as_str().unwrap_or("");
+            use sha2::{Digest, Sha256};
+            let payload_hash = hex::encode(Sha256::digest(payload.as_bytes()));
+            let signing_data = format!("{from_agent}|{to}|{payload_hash}");
+            let sig = identity.sign(signing_data.as_bytes());
+            body["signature"] = serde_json::json!(sig);
         }
     }
 
@@ -198,6 +229,9 @@ impl Tool for AgentsSendTool {
         if let Some(sid) = session_id {
             body["session_id"] = json!(sid);
         }
+
+        // Sign the message if identity is available (Phase 3B)
+        self.client.sign_send_body(&mut body);
 
         let resp = self
             .client
@@ -382,13 +416,16 @@ impl Tool for AgentsReplyTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'payload' parameter"))?;
 
-        let body = json!({
+        let mut body = json!({
             "to": to,
             "kind": "result",
             "payload": payload,
             "session_id": session_id,
             "priority": 0,
         });
+
+        // Sign the reply if identity is available (Phase 3B)
+        self.client.sign_send_body(&mut body);
 
         let resp = self
             .client

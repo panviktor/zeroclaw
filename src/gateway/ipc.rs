@@ -788,6 +788,10 @@ pub struct SendBody {
     pub session_id: Option<String>,
     #[serde(default)]
     pub priority: i32,
+    /// Ed25519 signature over `{from}|{to}|{seq}|{sha256(payload)}` (Phase 3B).
+    /// Optional — broker verifies only when agent has a registered public key.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -1447,6 +1451,69 @@ pub async fn handle_ipc_send(
                     Json(serde_json::json!({
                         "error": format!("Session exceeded {max} exchanges. Escalated to {coordinator}."),
                         "code": "session_limit_exceeded",
+                        "retryable": false
+                    })),
+                ));
+            }
+        }
+    }
+
+    // ── Phase 3B: Ed25519 signature verification ──────────────────
+    // If the sender has a registered public key, verify the signature.
+    // If no public key is registered, signature is not required (backward compat).
+    // If a signature is provided but invalid, the message is rejected.
+    if let Some(ref pubkey_hex) = db.get_agent_public_key(&meta.agent_id) {
+        match &body.signature {
+            Some(sig) => {
+                use sha2::{Digest, Sha256};
+                let payload_hash = hex::encode(Sha256::digest(body.payload.as_bytes()));
+                let signing_data = format!("{}|{}|{}", meta.agent_id, resolved_to, payload_hash);
+                if let Err(e) = crate::security::identity::verify_signature(
+                    pubkey_hex,
+                    signing_data.as_bytes(),
+                    sig,
+                ) {
+                    if let Some(ref logger) = state.audit_logger {
+                        let mut event = AuditEvent::ipc(
+                            AuditEventType::IpcBlocked,
+                            &meta.agent_id,
+                            Some(&resolved_to),
+                            &format!("signature_invalid: {e}"),
+                        );
+                        if let Some(a) = event.action.as_mut() {
+                            a.allowed = false;
+                        }
+                        let _ = logger.log(&event);
+                    }
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": "Invalid message signature",
+                            "code": "signature_invalid",
+                            "retryable": false
+                        })),
+                    ));
+                }
+            }
+            None => {
+                // Agent has a registered key but didn't sign — reject
+                if let Some(ref logger) = state.audit_logger {
+                    let mut event = AuditEvent::ipc(
+                        AuditEventType::IpcBlocked,
+                        &meta.agent_id,
+                        Some(&resolved_to),
+                        "signature_missing: agent has registered key but message is unsigned",
+                    );
+                    if let Some(a) = event.action.as_mut() {
+                        a.allowed = false;
+                    }
+                    let _ = logger.log(&event);
+                }
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Message signature required (agent has registered public key)",
+                        "code": "signature_missing",
                         "retryable": false
                     })),
                 ));
@@ -3663,5 +3730,98 @@ mod tests {
 
         let run = db.get_spawn_run("sess-already-done").unwrap();
         assert_eq!(run.result.as_deref(), Some("first result"));
+    }
+
+    // ── Phase 3B: Public key + signature verification tests ─────
+
+    #[test]
+    fn set_and_get_agent_public_key() {
+        let db = IpcDb::open_in_memory().unwrap();
+        db.update_last_seen("opus", 1, "coordinator");
+
+        assert!(db.get_agent_public_key("opus").is_none());
+
+        let identity = crate::security::identity::AgentIdentity::generate().unwrap();
+        let pubkey = identity.public_key_hex();
+
+        assert!(db.set_agent_public_key("opus", &pubkey));
+        assert_eq!(db.get_agent_public_key("opus").unwrap(), pubkey);
+    }
+
+    #[test]
+    fn public_key_not_found_for_unknown_agent() {
+        let db = IpcDb::open_in_memory().unwrap();
+        assert!(db.get_agent_public_key("nonexistent").is_none());
+    }
+
+    #[test]
+    fn signature_verification_valid() {
+        let identity = crate::security::identity::AgentIdentity::generate().unwrap();
+        let payload = "check status";
+        use sha2::{Digest, Sha256};
+        let payload_hash = hex::encode(Sha256::digest(payload.as_bytes()));
+        let signing_data = format!("opus|sentinel|{payload_hash}");
+        let sig = identity.sign(signing_data.as_bytes());
+
+        assert!(crate::security::identity::verify_signature(
+            &identity.public_key_hex(),
+            signing_data.as_bytes(),
+            &sig
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn signature_verification_wrong_payload_fails() {
+        let identity = crate::security::identity::AgentIdentity::generate().unwrap();
+        use sha2::{Digest, Sha256};
+        let payload_hash = hex::encode(Sha256::digest(b"original"));
+        let signing_data = format!("opus|sentinel|{payload_hash}");
+        let sig = identity.sign(signing_data.as_bytes());
+
+        let wrong_hash = hex::encode(Sha256::digest(b"tampered"));
+        let wrong_data = format!("opus|sentinel|{wrong_hash}");
+
+        assert!(crate::security::identity::verify_signature(
+            &identity.public_key_hex(),
+            wrong_data.as_bytes(),
+            &sig
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ipc_client_sign_send_body_adds_signature() {
+        use crate::tools::agents_ipc::IpcClient;
+
+        let identity = crate::security::identity::AgentIdentity::generate().unwrap();
+        let client = IpcClient::new("http://localhost:42617", "token", 10)
+            .with_identity(identity, "opus".into());
+
+        let mut body = serde_json::json!({
+            "to": "sentinel",
+            "kind": "text",
+            "payload": "hello",
+        });
+
+        client.sign_send_body(&mut body);
+        assert!(body["signature"].is_string());
+        let sig = body["signature"].as_str().unwrap();
+        assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn ipc_client_without_identity_does_not_sign() {
+        use crate::tools::agents_ipc::IpcClient;
+
+        let client = IpcClient::new("http://localhost:42617", "token", 10);
+
+        let mut body = serde_json::json!({
+            "to": "sentinel",
+            "payload": "hello",
+        });
+
+        client.sign_send_body(&mut body);
+        assert!(body["signature"].is_null());
     }
 }
