@@ -68,7 +68,7 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, security, job).await,
+            JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
         };
         last_output = output;
 
@@ -168,7 +168,7 @@ async fn run_agent_job(
     }
 
     match job.execution_mode {
-        ExecutionMode::InProcess => run_agent_job_in_process(config, job).await,
+        ExecutionMode::InProcess => Box::pin(run_agent_job_in_process(config, job)).await,
         ExecutionMode::Subprocess => run_agent_job_subprocess(config, job).await,
     }
 }
@@ -844,7 +844,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
@@ -859,7 +859,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -875,7 +875,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -1238,7 +1238,7 @@ mod tests {
         job.env_overlay
             .insert("ZEROCLAW_TIMEOUT_SECS".into(), "5".into());
 
-        let (_, output) = run_agent_job(&config, &security, &job).await;
+        let (_, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
 
         // Should either launch a process (status=) or report a spawn error.
         // In test context, current_exe() returns the test binary which doesn't
@@ -1257,7 +1257,7 @@ mod tests {
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         let job = subprocess_agent_job("should not run");
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -1274,7 +1274,7 @@ mod tests {
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         // InProcess mode should still work (will fail without provider key, same as before)
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }

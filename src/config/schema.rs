@@ -1324,6 +1324,18 @@ pub struct AgentsIpcConfig {
     /// Default: "opus".
     #[serde(default = "default_coordinator_agent")]
     pub coordinator_agent: String,
+
+    /// Named workload profiles for ephemeral spawn (Phase 3A).
+    /// Workloads can only narrow the execution boundary — they cannot grant
+    /// tools or autonomy beyond what the trust level allows.
+    ///
+    /// ```toml
+    /// [agents_ipc.workload_profiles.research]
+    /// model = "claude-sonnet-4-6"
+    /// allowed_tools = ["web_search", "web_fetch", "memory_read"]
+    /// ```
+    #[serde(default)]
+    pub workload_profiles: HashMap<String, crate::security::execution::WorkloadProfile>,
 }
 
 /// PromptGuard configuration for IPC message payload scanning.
@@ -1411,6 +1423,7 @@ impl Default for AgentsIpcConfig {
             prompt_guard: IpcPromptGuardConfig::default(),
             session_max_exchanges: default_session_max_exchanges(),
             coordinator_agent: default_coordinator_agent(),
+            workload_profiles: HashMap::new(),
         }
     }
 }
