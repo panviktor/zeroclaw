@@ -74,6 +74,10 @@ pub struct AuditEvent {
     pub action: Option<Action>,
     pub result: Option<ExecutionResult>,
     pub security: SecurityContext,
+    /// HMAC-SHA256 chain value: HMAC(key, "{prev_hmac}|{event_json}").
+    /// Present when HMAC audit chain is enabled (Phase 3B).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<String>,
 }
 
 impl AuditEvent {
@@ -91,6 +95,7 @@ impl AuditEvent {
                 rate_limit_remaining: None,
                 sandbox_backend: None,
             },
+            hmac: None,
         }
     }
 
@@ -167,11 +172,15 @@ impl AuditEvent {
     }
 }
 
-/// Audit logger
+/// Audit logger with optional HMAC-SHA256 chain for tamper detection.
 pub struct AuditLogger {
     log_path: PathBuf,
     config: AuditConfig,
     buffer: Mutex<Vec<AuditEvent>>,
+    /// HMAC key for chain computation (loaded from audit.key file).
+    hmac_key: Option<Vec<u8>>,
+    /// Previous HMAC in the chain (hex-encoded). Updated on each log().
+    prev_hmac: Mutex<String>,
 }
 
 /// Structured command execution details for audit logging.
@@ -187,17 +196,47 @@ pub struct CommandExecutionLog<'a> {
 }
 
 impl AuditLogger {
-    /// Create a new audit logger
+    /// Create a new audit logger.
+    ///
+    /// If the HMAC key file (`audit.key`) exists in the zeroclaw dir, loads it.
+    /// If not, generates a new 32-byte key and saves it. HMAC chain is enabled
+    /// automatically when the key is available.
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
         let log_path = zeroclaw_dir.join(&config.log_path);
+        let key_path = zeroclaw_dir.join("audit.key");
+
+        let hmac_key = if config.sign_events {
+            match load_or_generate_hmac_key(&key_path) {
+                Ok(key) => {
+                    tracing::info!("HMAC audit chain enabled");
+                    Some(key)
+                }
+                Err(e) => {
+                    tracing::warn!("HMAC audit chain disabled: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Read the last HMAC from the existing log file (if any) to continue the chain
+        let prev_hmac = if hmac_key.is_some() {
+            read_last_hmac(&log_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         Ok(Self {
             log_path,
             config,
             buffer: Mutex::new(Vec::new()),
+            hmac_key,
+            prev_hmac: Mutex::new(prev_hmac),
         })
     }
 
-    /// Log an event
+    /// Log an event, computing HMAC chain if key is available.
     pub fn log(&self, event: &AuditEvent) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
@@ -206,14 +245,30 @@ impl AuditLogger {
         // Check log size and rotate if needed
         self.rotate_if_needed()?;
 
+        let mut event = event.clone();
+
+        // Compute HMAC chain: HMAC(key, "{prev_hmac}|{event_json_without_hmac}")
+        if let Some(ref key) = self.hmac_key {
+            // Serialize event without hmac field for signing
+            event.hmac = None;
+            let event_json = serde_json::to_string(&event)?;
+
+            let prev = self.prev_hmac.lock().clone();
+            let chain_input = format!("{prev}|{event_json}");
+            let hmac_hex = compute_hmac_sha256(key, chain_input.as_bytes());
+
+            event.hmac = Some(hmac_hex.clone());
+            *self.prev_hmac.lock() = hmac_hex;
+        }
+
         // Serialize and write
-        let line = serde_json::to_string(event)?;
+        let line = serde_json::to_string(&event)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)?;
 
-        writeln!(file, "{}", line)?;
+        writeln!(file, "{line}")?;
         file.sync_all()?;
 
         Ok(())
@@ -280,6 +335,121 @@ impl AuditLogger {
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
     }
+}
+
+// ── HMAC chain helpers ──────────────────────────────────────────
+
+/// Compute HMAC-SHA256 and return hex-encoded result.
+fn compute_hmac_sha256(key: &[u8], data: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    mac.update(data);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Load HMAC key from file, or generate and save a new one (32 random bytes).
+fn load_or_generate_hmac_key(path: &std::path::Path) -> Result<Vec<u8>> {
+    if path.exists() {
+        let data = std::fs::read(path)?;
+        if data.len() < 16 {
+            anyhow::bail!("HMAC key file too short ({} bytes)", data.len());
+        }
+        Ok(data)
+    } else {
+        let key: [u8; 32] = rand::random();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, key)?;
+        Ok(key.to_vec())
+    }
+}
+
+/// Read the last HMAC value from an existing audit log file.
+/// Returns empty string if file doesn't exist or has no HMAC entries.
+fn read_last_hmac(log_path: &std::path::Path) -> Result<String> {
+    use std::io::BufRead;
+
+    if !log_path.exists() {
+        return Ok(String::new());
+    }
+
+    let file = std::fs::File::open(log_path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut last_hmac = String::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if let Ok(event) = serde_json::from_str::<AuditEvent>(&line) {
+            if let Some(hmac) = event.hmac {
+                last_hmac = hmac;
+            }
+        }
+    }
+
+    Ok(last_hmac)
+}
+
+/// Verify the HMAC chain in an audit log file.
+///
+/// Returns `Ok(count)` with the number of verified entries, or `Err` with
+/// details about the first broken link.
+pub fn verify_audit_chain(log_path: &std::path::Path, key_path: &std::path::Path) -> Result<usize> {
+    use std::io::BufRead;
+
+    let key = std::fs::read(key_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read HMAC key at {}: {e}", key_path.display()))?;
+
+    let file = std::fs::File::open(log_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open audit log at {}: {e}", log_path.display()))?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut prev_hmac = String::new();
+    let mut verified = 0usize;
+
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let event: AuditEvent = serde_json::from_str(&line)
+            .map_err(|e| anyhow::anyhow!("Line {}: invalid JSON: {e}", line_num + 1))?;
+
+        let stored_hmac = match &event.hmac {
+            Some(h) => h.clone(),
+            None => {
+                // Entry without HMAC — skip (pre-chain entries)
+                continue;
+            }
+        };
+
+        // Recompute: serialize event without hmac, then HMAC("{prev}|{json}")
+        let mut event_for_hash = event;
+        event_for_hash.hmac = None;
+        let event_json = serde_json::to_string(&event_for_hash)?;
+        let chain_input = format!("{prev_hmac}|{event_json}");
+        let expected_hmac = compute_hmac_sha256(&key, chain_input.as_bytes());
+
+        if stored_hmac != expected_hmac {
+            anyhow::bail!(
+                "HMAC chain broken at line {} (event_id={}): \
+                 expected={}, stored={}",
+                line_num + 1,
+                event_for_hash.event_id,
+                &expected_hmac[..16],
+                &stored_hmac[..16],
+            );
+        }
+
+        prev_hmac = stored_hmac;
+        verified += 1;
+    }
+
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -443,5 +613,136 @@ mod tests {
             "rotation must create .1.log backup"
         );
         Ok(())
+    }
+
+    // ── HMAC chain tests ────────────────────────────────────────
+
+    #[test]
+    fn hmac_chain_write_and_verify() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let config = AuditConfig {
+            enabled: true,
+            log_path: "audit.log".into(),
+            max_size_mb: 100,
+            sign_events: true,
+        };
+
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        // Log 3 events
+        for _ in 0..3 {
+            logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        }
+
+        // Verify chain
+        let log_path = tmp.path().join("audit.log");
+        let key_path = tmp.path().join("audit.key");
+        let verified = verify_audit_chain(&log_path, &key_path)?;
+        assert_eq!(verified, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn hmac_chain_detects_tampered_entry() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let config = AuditConfig {
+            enabled: true,
+            log_path: "audit.log".into(),
+            max_size_mb: 100,
+            sign_events: true,
+        };
+
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.log(&AuditEvent::new(AuditEventType::CommandExecution))?;
+        drop(logger);
+
+        // Tamper with the log: modify a payload
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let tampered = content.replace("command_execution", "policy_violation");
+        std::fs::write(&log_path, tampered)?;
+
+        let key_path = tmp.path().join("audit.key");
+        let result = verify_audit_chain(&log_path, &key_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("chain broken"));
+        Ok(())
+    }
+
+    #[test]
+    fn hmac_chain_continues_after_restart() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let config = AuditConfig {
+            enabled: true,
+            log_path: "audit.log".into(),
+            max_size_mb: 100,
+            sign_events: true,
+        };
+
+        // First logger session
+        {
+            let logger = AuditLogger::new(config.clone(), tmp.path().to_path_buf())?;
+            logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+            logger.log(&AuditEvent::new(AuditEventType::IpcSend))?;
+        }
+
+        // Second logger session (simulates restart)
+        {
+            let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+            logger.log(&AuditEvent::new(AuditEventType::IpcBlocked))?;
+        }
+
+        // All 3 entries should form a valid chain
+        let log_path = tmp.path().join("audit.log");
+        let key_path = tmp.path().join("audit.key");
+        let verified = verify_audit_chain(&log_path, &key_path)?;
+        assert_eq!(verified, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn hmac_chain_detects_deleted_entry() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let config = AuditConfig {
+            enabled: true,
+            log_path: "audit.log".into(),
+            max_size_mb: 100,
+            sign_events: true,
+        };
+
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        for _ in 0..3 {
+            logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        }
+        drop(logger);
+
+        // Delete the second line
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        let tampered = format!("{}\n{}\n", lines[0], lines[2]);
+        std::fs::write(&log_path, tampered)?;
+
+        let key_path = tmp.path().join("audit.key");
+        let result = verify_audit_chain(&log_path, &key_path);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn hmac_key_generated_on_first_use() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("audit.key");
+        assert!(!key_path.exists());
+
+        let key = load_or_generate_hmac_key(&key_path).unwrap();
+        assert_eq!(key.len(), 32);
+        assert!(key_path.exists());
+
+        // Second load returns the same key
+        let key2 = load_or_generate_hmac_key(&key_path).unwrap();
+        assert_eq!(key, key2);
     }
 }

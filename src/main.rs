@@ -450,6 +450,19 @@ Examples:
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
+    /// Verify the HMAC audit chain integrity
+    #[command(name = "audit")]
+    Audit {
+        #[command(subcommand)]
+        audit_command: AuditCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCommands {
+    /// Verify the HMAC chain in the audit log
+    Verify,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1166,6 +1179,28 @@ async fn main() -> Result<()> {
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
                 Ok(())
+            }
+        },
+
+        Commands::Audit { audit_command } => match audit_command {
+            AuditCommands::Verify => {
+                let log_path = config.workspace_dir.join(&config.security.audit.log_path);
+                let key_path = config
+                    .config_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("audit.key");
+
+                match security::audit::verify_audit_chain(&log_path, &key_path) {
+                    Ok(count) => {
+                        println!("Audit chain verified: {count} entries, no breaks detected.");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("Audit chain verification FAILED: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         },
     }
