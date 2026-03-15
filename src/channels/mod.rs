@@ -31,6 +31,7 @@ pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
 pub mod qq;
+pub mod session_store;
 pub mod signal;
 pub mod slack;
 pub mod telegram;
@@ -312,6 +313,7 @@ struct ChannelRuntimeContext {
     model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
     ack_reactions: bool,
     show_tool_calls: bool,
+    session_store: Option<Arc<session_store::SessionStore>>,
 }
 
 #[derive(Clone)]
@@ -983,6 +985,13 @@ fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+    // Persist to JSONL before adding to in-memory history.
+    if let Some(ref store) = ctx.session_store {
+        if let Err(e) = store.append(sender_key, &turn) {
+            tracing::warn!("Failed to persist session turn: {e}");
+        }
+    }
+
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -2204,6 +2213,29 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Fire-and-forget LLM-driven memory consolidation.
+            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                let provider = Arc::clone(&ctx.provider);
+                let model = ctx.model.to_string();
+                let memory = Arc::clone(&ctx.memory);
+                let user_msg = msg.content.clone();
+                let assistant_resp = delivered_response.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::memory::consolidation::consolidate_turn(
+                        provider.as_ref(),
+                        &model,
+                        memory.as_ref(),
+                        &user_msg,
+                        &assistant_resp,
+                    )
+                    .await
+                    {
+                        tracing::debug!("Memory consolidation skipped: {e}");
+                    }
+                });
+            }
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -3836,7 +3868,41 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model_routes: Arc::new(config.model_routes.clone()),
         ack_reactions: config.channels_config.ack_reactions,
         show_tool_calls: config.channels_config.show_tool_calls,
+        session_store: if config.channels_config.session_persistence {
+            match session_store::SessionStore::new(&config.workspace_dir) {
+                Ok(store) => {
+                    tracing::info!("📂 Session persistence enabled");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    tracing::warn!("Session persistence disabled: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        },
     });
+
+    // Hydrate in-memory conversation histories from persisted JSONL session files.
+    if let Some(ref store) = runtime_ctx.session_store {
+        let mut hydrated = 0usize;
+        let mut histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in store.list_sessions() {
+            let msgs = store.load(&key);
+            if !msgs.is_empty() {
+                hydrated += 1;
+                histories.insert(key, msgs);
+            }
+        }
+        drop(histories);
+        if hydrated > 0 {
+            tracing::info!("📂 Restored {hydrated} session(s) from disk");
+        }
+    }
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
 
@@ -4103,6 +4169,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4206,6 +4273,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4265,6 +4333,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4782,6 +4851,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -4849,6 +4919,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -4930,6 +5001,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -4996,6 +5068,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -5072,6 +5145,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -5168,6 +5242,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -5246,6 +5321,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -5339,6 +5415,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -5417,6 +5494,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -5485,6 +5563,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -5664,6 +5743,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5751,6 +5831,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5848,6 +5929,7 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5952,6 +6034,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6033,6 +6116,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -6099,6 +6183,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -6723,6 +6808,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -6815,6 +6901,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -6907,6 +6994,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
@@ -7463,6 +7551,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7536,6 +7625,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            session_store: None,
         });
 
         process_channel_message(
