@@ -136,7 +136,7 @@ impl IpcClient {
                     } else {
                         tracing::error!(
                             "Failed to register public key after 3 attempts: {e}. \
-                             Agent will operate in unsigned mode until next restart."
+                             Will continue retrying in background."
                         );
                     }
                 }
