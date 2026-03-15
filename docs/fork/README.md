@@ -15,13 +15,14 @@ This directory contains the strategy, plans, and operational docs for the ZeroCl
 | [ipc-phase2-progress.md](ipc-phase2-progress.md) | Phase 2 execution checklist (8 steps) | Opus |
 | [ipc-quickstart.md](ipc-quickstart.md) | Minimal configs, pairing flow, smoke-test curl commands | Everyone |
 | [ipc-phase3-plan.md](ipc-phase3-plan.md) | Phase 3: Trusted Execution — ephemeral agents, fail-closed sandbox, subprocess isolation, crypto provenance | Everyone |
-| [ipc-phase3-progress.md](ipc-phase3-progress.md) | Phase 3A execution checklist (7 steps — DONE) | Opus |
+| [ipc-phase3-progress.md](ipc-phase3-progress.md) | Phase 3A/3B execution checklist (all steps — DONE) | Opus |
+| [ipc-phase3_5-plan.md](ipc-phase3_5-plan.md) | Phase 3.5: Human Control Plane — IPC operator UI (6 screens, 10 steps) | Everyone |
 
 ## Reading order
 
 **New to the fork?** Start with `ipc-plan.md` → `sync-strategy.md` → `delta-registry.md`.
 
-**Starting IPC work?** Phase 1 and 2 are complete. For Phase 3, read `ipc-phase3-plan.md` — start with Architectural Decisions (AD-1 through AD-6), then Implementation Steps.
+**Starting IPC work?** Phases 1-3B are complete. For Phase 3.5 (operator UI), read `ipc-phase3_5-plan.md` — start with Architectural Decisions, then Implementation Steps.
 
 **Setting up IPC locally?** Follow `ipc-quickstart.md` — configs, pairing, smoke tests.
 
