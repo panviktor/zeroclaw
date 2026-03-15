@@ -364,7 +364,13 @@ fn resolve_heartbeat_delivery(config: &Config) -> Result<Option<(String, String)
 /// Auto-detect the best channel for heartbeat delivery by checking which
 /// channels are configured. Returns the first match in priority order.
 fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
-    // Priority order: telegram > discord > slack > mattermost
+    // Priority order: matrix > telegram > discord > slack > mattermost
+    if let Some(mx) = &config.channels_config.matrix {
+        let target = mx.allowed_users.first().cloned().unwrap_or_default();
+        if !target.is_empty() {
+            return Some(("matrix".to_string(), target));
+        }
+    }
     if let Some(tg) = &config.channels_config.telegram {
         // Use the first allowed_user as target, or fall back to empty (broadcast)
         let target = tg.allowed_users.first().cloned().unwrap_or_default();
@@ -414,6 +420,13 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
             if config.channels_config.mattermost.is_none() {
                 anyhow::bail!(
                     "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
+                );
+            }
+        }
+        "matrix" => {
+            if config.channels_config.matrix.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to matrix but channels_config.matrix is not configured"
                 );
             }
         }
