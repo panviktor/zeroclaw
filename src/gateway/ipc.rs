@@ -3946,13 +3946,15 @@ mod tests {
         assert!(body["signature"].is_string());
         assert!(body["sender_seq"].is_number());
         assert!(body["sender_timestamp"].is_number());
-        assert_eq!(body["sender_seq"].as_i64().unwrap(), 1);
+        let seq1 = body["sender_seq"].as_i64().unwrap();
+        assert!(seq1 > 0, "sender_seq must be positive");
 
         // Second call increments seq
         let mut body2 = body.clone();
         body2["signature"] = serde_json::json!(null);
         body2["sender_seq"] = serde_json::json!(null);
         client.sign_send_body(&mut body2);
-        assert_eq!(body2["sender_seq"].as_i64().unwrap(), 2);
+        let seq2 = body2["sender_seq"].as_i64().unwrap();
+        assert_eq!(seq2, seq1 + 1, "sender_seq must increment monotonically");
     }
 }

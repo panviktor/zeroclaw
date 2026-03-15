@@ -2942,21 +2942,30 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle) = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    );
+    let (mut tools_registry, delegate_handle, ipc_client_for_key_reg) =
+        tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            mem.clone(),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &config.workspace_dir,
+            &config.agents,
+            config.api_key.as_deref(),
+            &config,
+        );
+
+    // ── Phase 3B: Auto-register Ed25519 public key with broker ────
+    if let Some(ref ipc_client) = ipc_client_for_key_reg {
+        match ipc_client.register_public_key().await {
+            Ok(()) => tracing::info!("Ed25519 public key registered with broker"),
+            Err(e) => tracing::warn!("Failed to register public key: {e}"),
+        }
+    }
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
@@ -3576,7 +3585,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle_pm) = tools::all_tools_with_runtime(
+    let (mut tools_registry, delegate_handle_pm, _) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,

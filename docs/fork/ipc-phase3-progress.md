@@ -92,13 +92,23 @@ All findings from two rounds of code review have been addressed:
 - MCP injected after allowlist filter → MCP suppressed under allowlist (#49)
 - Delegate held unfiltered parent_tools → delegate_handle filtered too (#49)
 
-## What's next: Phase 3B (deferred)
+## Phase 3B: Hardening — DONE
 
-Phase 3B adds cryptographic provenance — not started, depends on Phase 3A stability.
+| Step | Title | PR | Status |
+|------|-------|----|--------|
+| 7 | Ed25519 agent identity | #51 | Done |
+| 8 | Signed messages | #52 | Done |
+| 9 | HMAC audit chain | #53 | Done |
+| 10 | Sender-side replay protection | #54 | Done |
+| — | Operational fixes (agent_id, auto-register, persist seq) | #55 | Done |
 
-| Step | Title | Status |
-|------|-------|--------|
-| 7 | Ed25519 agent identity | Not started |
-| 8 | Signed messages | Not started |
-| 9 | HMAC audit chain | Not started |
-| 10 | Sender-side replay protection | Not started |
+### What Phase 3B provides
+
+- **Ed25519 agent identity**: keypair per agent (persistent or ephemeral), broker stores public key
+- **Signed messages**: client auto-signs `{from}|{to}|{seq}|{timestamp}|{sha256(payload)}`; broker verifies against registered pubkey
+- **HMAC audit chain**: chained HMAC-SHA256 on audit events, `zeroclaw audit verify` CLI
+- **Replay protection**: sender-side monotonic seq (persisted) + 5-min timestamp window
+
+### Scope clarification
+
+Phase 3B uses **broker-bound public key registration** — the broker stores each agent's pubkey and verifies signatures directly. The delegation certificate primitives exist (`DelegationCertificate` in `identity.rs`) but are not integrated into the transport. Third-party verifiable delegation is deferred to a future phase if needed.
