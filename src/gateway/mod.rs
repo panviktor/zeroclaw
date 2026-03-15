@@ -808,6 +808,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(ipc::handle_admin_ipc_downgrade),
         )
         .route("/admin/ipc/promote", post(ipc::handle_admin_ipc_promote))
+        // ── IPC admin read endpoints (Phase 3.5) ──
+        .route(
+            "/admin/ipc/agents/{id}/detail",
+            get(ipc::handle_admin_ipc_agent_detail),
+        )
+        .route("/admin/ipc/messages", get(ipc::handle_admin_ipc_messages))
+        .route(
+            "/admin/ipc/spawn-runs",
+            get(ipc::handle_admin_ipc_spawn_runs),
+        )
+        .route("/admin/ipc/audit", get(ipc::handle_admin_ipc_audit))
+        .route(
+            "/admin/ipc/audit/verify",
+            post(ipc::handle_admin_ipc_audit_verify),
+        )
+        .route(
+            "/admin/ipc/dismiss-message",
+            post(ipc::handle_admin_ipc_dismiss_message),
+        )
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))

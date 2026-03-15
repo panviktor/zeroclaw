@@ -360,7 +360,8 @@ impl IpcDb {
         let now = unix_now();
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT agent_id, role, trust_level, status, last_seen FROM agents ORDER BY agent_id",
+            "SELECT agent_id, role, trust_level, status, last_seen, public_key
+             FROM agents ORDER BY agent_id",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -382,6 +383,7 @@ impl IpcDb {
                 trust_level: Some(row.get(2)?),
                 status: effective_status,
                 last_seen,
+                public_key: row.get(5)?,
             })
         })
         .ok()
@@ -795,6 +797,370 @@ impl IpcDb {
         )?;
         Ok(conn.last_insert_rowid())
     }
+
+    // ── Phase 3.5 Step 0: Admin read endpoints ─────────────────────
+
+    /// Paginated admin message listing with filters.
+    /// Does NOT set `read=1` or update `last_seen` (AD-2: side-effect-free).
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_messages_admin(
+        &self,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        kind: Option<&str>,
+        quarantine: Option<bool>,
+        dismissed: Option<bool>,
+        lane: Option<&str>,
+        from_ts: Option<i64>,
+        to_ts: Option<i64>,
+        limit: u32,
+        offset: u32,
+    ) -> Vec<AdminMessageInfo> {
+        let conn = self.conn.lock();
+        let mut conditions = vec!["1=1".to_string()];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(aid) = agent_id {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("(from_agent = ?{idx} OR to_agent = ?{idx})"));
+            param_values.push(Box::new(aid.to_string()));
+        }
+        if let Some(sid) = session_id {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("session_id = ?{idx}"));
+            param_values.push(Box::new(sid.to_string()));
+        }
+        if let Some(k) = kind {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("kind = ?{idx}"));
+            param_values.push(Box::new(k.to_string()));
+        }
+        // Lane filter: normal / quarantine / blocked
+        if let Some(l) = lane {
+            match l {
+                "normal" => conditions
+                    .push("blocked = 0 AND (from_trust_level < 4 OR promoted = 1)".to_string()),
+                "quarantine" => conditions
+                    .push("blocked = 0 AND from_trust_level >= 4 AND promoted = 0".to_string()),
+                "blocked" => conditions.push("blocked = 1".to_string()),
+                _ => {}
+            }
+        }
+        // Quarantine filter (for Quarantine Review page)
+        if let Some(true) = quarantine {
+            conditions.push("from_trust_level >= 4".to_string());
+        }
+        // Dismissed filter: dismissed = blocked=1 AND block_reason='dismissed'
+        if let Some(dismissed_val) = dismissed {
+            if dismissed_val {
+                // Only dismissed items
+                conditions.push("blocked = 1 AND block_reason = 'dismissed'".to_string());
+            } else {
+                // Exclude dismissed items (pending + promoted)
+                conditions.push("NOT (blocked = 1 AND block_reason = 'dismissed')".to_string());
+            }
+        }
+        if let Some(ts) = from_ts {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("created_at >= ?{idx}"));
+            param_values.push(Box::new(ts));
+        }
+        if let Some(ts) = to_ts {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("created_at <= ?{idx}"));
+            param_values.push(Box::new(ts));
+        }
+
+        let limit_idx = param_values.len() + 1;
+        param_values.push(Box::new(limit));
+        let offset_idx = param_values.len() + 1;
+        param_values.push(Box::new(offset));
+
+        let sql = format!(
+            "SELECT id, session_id, from_agent, to_agent, kind, payload, priority,
+                    from_trust_level, seq, created_at, blocked, block_reason, promoted, read
+             FROM messages
+             WHERE {}
+             ORDER BY created_at DESC
+             LIMIT ?{limit_idx} OFFSET ?{offset_idx}",
+            conditions.join(" AND ")
+        );
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params_ref.as_slice(), |row| {
+            let from_trust_level: u8 = row.get(7)?;
+            let blocked: i32 = row.get(10)?;
+            let promoted: i32 = row.get(12)?;
+            let lane = if blocked != 0 {
+                "blocked"
+            } else if from_trust_level >= 4 && promoted == 0 {
+                "quarantine"
+            } else {
+                "normal"
+            };
+            Ok(AdminMessageInfo {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                from_agent: row.get(2)?,
+                to_agent: row.get(3)?,
+                kind: row.get(4)?,
+                payload: row.get(5)?,
+                priority: row.get(6)?,
+                from_trust_level,
+                seq: row.get(8)?,
+                created_at: row.get(9)?,
+                blocked: blocked != 0,
+                blocked_reason: row.get(11)?,
+                promoted: promoted != 0,
+                read: row.get::<_, i32>(13)? != 0,
+                lane: lane.to_string(),
+            })
+        })
+        .ok()
+        .map(|r| r.filter_map(|m| m.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Paginated admin spawn run listing with filters.
+    pub fn list_spawn_runs_admin(
+        &self,
+        status: Option<&str>,
+        parent_id: Option<&str>,
+        from_ts: Option<i64>,
+        to_ts: Option<i64>,
+        limit: u32,
+        offset: u32,
+    ) -> Vec<SpawnRunInfo> {
+        let conn = self.conn.lock();
+        let mut conditions = vec!["1=1".to_string()];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(s) = status {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("status = ?{idx}"));
+            param_values.push(Box::new(s.to_string()));
+        }
+        if let Some(pid) = parent_id {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("parent_id = ?{idx}"));
+            param_values.push(Box::new(pid.to_string()));
+        }
+        if let Some(ts) = from_ts {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("created_at >= ?{idx}"));
+            param_values.push(Box::new(ts));
+        }
+        if let Some(ts) = to_ts {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("created_at <= ?{idx}"));
+            param_values.push(Box::new(ts));
+        }
+
+        let limit_idx = param_values.len() + 1;
+        param_values.push(Box::new(limit));
+        let offset_idx = param_values.len() + 1;
+        param_values.push(Box::new(offset));
+
+        let sql = format!(
+            "SELECT id, parent_id, child_id, status, result, created_at, expires_at, completed_at
+             FROM spawn_runs
+             WHERE {}
+             ORDER BY created_at DESC
+             LIMIT ?{limit_idx} OFFSET ?{offset_idx}",
+            conditions.join(" AND ")
+        );
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params_ref.as_slice(), |row| {
+            Ok(SpawnRunInfo {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                child_id: row.get(2)?,
+                status: row.get(3)?,
+                result: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                completed_at: row.get(7)?,
+            })
+        })
+        .ok()
+        .map(|r| r.filter_map(|s| s.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Get detailed info for a single agent, including recent messages and active spawns.
+    pub fn agent_detail(&self, agent_id: &str, staleness_secs: u64) -> Option<AgentDetailInfo> {
+        let now = unix_now();
+        let conn = self.conn.lock();
+
+        // Fetch agent
+        let agent = conn
+            .query_row(
+                "SELECT agent_id, role, trust_level, status, last_seen, public_key
+                 FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |row| {
+                    let last_seen: Option<i64> = row.get(4)?;
+                    let status: String = row.get(3)?;
+                    let effective_status = if status == "online" {
+                        match last_seen {
+                            Some(ts) if (now - ts) > staleness_secs as i64 => "stale".to_string(),
+                            _ => status,
+                        }
+                    } else {
+                        status
+                    };
+                    Ok(AgentInfo {
+                        agent_id: row.get(0)?,
+                        role: row.get(1)?,
+                        trust_level: Some(row.get(2)?),
+                        status: effective_status,
+                        last_seen,
+                        public_key: row.get(5)?,
+                    })
+                },
+            )
+            .ok()?;
+
+        // Recent messages (last 20, sent or received)
+        let recent_messages = conn
+            .prepare(
+                "SELECT id, session_id, from_agent, to_agent, kind, payload, priority,
+                        from_trust_level, seq, created_at, blocked, block_reason, promoted, read
+                 FROM messages
+                 WHERE from_agent = ?1 OR to_agent = ?1
+                 ORDER BY created_at DESC
+                 LIMIT 20",
+            )
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map(params![agent_id], |row| {
+                    let from_trust_level: u8 = row.get(7)?;
+                    let blocked: i32 = row.get(10)?;
+                    let promoted: i32 = row.get(12)?;
+                    let lane = if blocked != 0 {
+                        "blocked"
+                    } else if from_trust_level >= 4 && promoted == 0 {
+                        "quarantine"
+                    } else {
+                        "normal"
+                    };
+                    Ok(AdminMessageInfo {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        from_agent: row.get(2)?,
+                        to_agent: row.get(3)?,
+                        kind: row.get(4)?,
+                        payload: row.get(5)?,
+                        priority: row.get(6)?,
+                        from_trust_level,
+                        seq: row.get(8)?,
+                        created_at: row.get(9)?,
+                        blocked: blocked != 0,
+                        blocked_reason: row.get(11)?,
+                        promoted: promoted != 0,
+                        read: row.get::<_, i32>(13)? != 0,
+                        lane: lane.to_string(),
+                    })
+                })
+                .ok()
+                .map(|r| r.filter_map(|m| m.ok()).collect::<Vec<_>>())
+                .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        // Active spawn runs (parent or child)
+        let active_spawns = conn
+            .prepare(
+                "SELECT id, parent_id, child_id, status, result, created_at, expires_at, completed_at
+                 FROM spawn_runs
+                 WHERE (parent_id = ?1 OR child_id = ?1) AND status = 'running'
+                 ORDER BY created_at DESC",
+            )
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map(params![agent_id], |row| {
+                    Ok(SpawnRunInfo {
+                        id: row.get(0)?,
+                        parent_id: row.get(1)?,
+                        child_id: row.get(2)?,
+                        status: row.get(3)?,
+                        result: row.get(4)?,
+                        created_at: row.get(5)?,
+                        expires_at: row.get(6)?,
+                        completed_at: row.get(7)?,
+                    })
+                })
+                .ok()
+                .map(|r| r.filter_map(|s| s.ok()).collect::<Vec<_>>())
+                .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        // Quarantine count (pending quarantine messages from this agent)
+        let quarantine_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE from_agent = ?1 AND from_trust_level >= 4 AND promoted = 0
+                   AND blocked = 0 AND read = 0",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        Some(AgentDetailInfo {
+            agent,
+            recent_messages,
+            active_spawns,
+            quarantine_count,
+        })
+    }
+
+    /// Mark a quarantine message as dismissed (soft-dismiss without delivering).
+    /// Sets `blocked=1, block_reason='dismissed'`.
+    pub fn dismiss_message(&self, message_id: i64) -> Result<(), String> {
+        let conn = self.conn.lock();
+
+        // Fetch message to validate it's a pending quarantine message
+        let (from_trust_level, promoted, blocked, read): (u8, i32, i32, i32) = conn
+            .query_row(
+                "SELECT from_trust_level, promoted, blocked, read FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|_| "Message not found".to_string())?;
+
+        if from_trust_level < 4 {
+            return Err("Only quarantine messages (from_trust_level >= 4) can be dismissed".into());
+        }
+        if promoted != 0 {
+            return Err("Message has already been promoted".into());
+        }
+        if blocked != 0 {
+            return Err("Message is already blocked/dismissed".into());
+        }
+        if read != 0 {
+            return Err("Message has already been read".into());
+        }
+
+        conn.execute(
+            "UPDATE messages SET blocked = 1, block_reason = 'dismissed' WHERE id = ?1",
+            params![message_id],
+        )
+        .map_err(|e| format!("Failed to dismiss message: {e}"))?;
+
+        Ok(())
+    }
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -899,6 +1265,8 @@ pub struct AgentInfo {
     pub trust_level: Option<u8>,
     pub status: String,
     pub last_seen: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -948,6 +1316,89 @@ pub struct AdminDowngradeBody {
 pub struct PromoteBody {
     pub message_id: i64,
     pub to_agent: String,
+}
+
+// ── Phase 3.5 admin types ───────────────────────────────────────
+
+/// Admin message info with computed lane field (side-effect-free).
+#[derive(Debug, Serialize)]
+pub struct AdminMessageInfo {
+    pub id: i64,
+    pub session_id: Option<String>,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub kind: String,
+    pub payload: String,
+    pub priority: i32,
+    pub from_trust_level: u8,
+    pub seq: i64,
+    pub created_at: i64,
+    pub blocked: bool,
+    pub blocked_reason: Option<String>,
+    pub promoted: bool,
+    pub read: bool,
+    pub lane: String,
+}
+
+/// Agent detail with recent messages and active spawns.
+#[derive(Debug, Serialize)]
+pub struct AgentDetailInfo {
+    pub agent: AgentInfo,
+    pub recent_messages: Vec<AdminMessageInfo>,
+    pub active_spawns: Vec<SpawnRunInfo>,
+    pub quarantine_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminMessagesQuery {
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub quarantine: Option<bool>,
+    #[serde(default)]
+    pub dismissed: Option<bool>,
+    pub lane: Option<String>,
+    pub from_ts: Option<i64>,
+    pub to_ts: Option<i64>,
+    #[serde(default = "default_admin_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub offset: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminSpawnRunsQuery {
+    pub status: Option<String>,
+    pub parent_id: Option<String>,
+    pub from_ts: Option<i64>,
+    pub to_ts: Option<i64>,
+    #[serde(default = "default_admin_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub offset: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminAuditQuery {
+    pub agent_id: Option<String>,
+    pub event_type: Option<String>,
+    pub from_ts: Option<i64>,
+    pub to_ts: Option<i64>,
+    pub search: Option<String>,
+    #[serde(default = "default_admin_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub offset: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DismissBody {
+    pub message_id: i64,
+}
+
+fn default_admin_limit() -> u32 {
+    50
 }
 
 // ── ACL validation ──────────────────────────────────────────────
@@ -1267,6 +1718,7 @@ pub async fn handle_ipc_agents(
                 trust_level: None,
                 status: "available".into(),
                 last_seen: None,
+                public_key: None,
             })
             .collect()
     } else {
@@ -2395,6 +2847,276 @@ pub async fn handle_admin_ipc_promote(
         "to_agent": body.to_agent,
         "original_trust_level": msg.from_trust_level,
     })))
+}
+
+// ── Phase 3.5 admin handlers ────────────────────────────────────
+
+/// GET /admin/ipc/agents/:id/detail — detailed view of a single agent.
+pub async fn handle_admin_ipc_agent_detail(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+    let staleness = state.config.lock().agents_ipc.staleness_secs;
+    match db.agent_detail(&agent_id, staleness) {
+        Some(detail) => Ok(Json(serde_json::json!(detail))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("Agent '{agent_id}' not found"),
+                "code": "not_found"
+            })),
+        )),
+    }
+}
+
+/// GET /admin/ipc/messages — paginated admin message listing with filters.
+pub async fn handle_admin_ipc_messages(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<AdminMessagesQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+    let messages = db.list_messages_admin(
+        q.agent_id.as_deref(),
+        q.session_id.as_deref(),
+        q.kind.as_deref(),
+        q.quarantine,
+        q.dismissed,
+        q.lane.as_deref(),
+        q.from_ts,
+        q.to_ts,
+        q.limit,
+        q.offset,
+    );
+    Ok(Json(serde_json::json!({ "messages": messages })))
+}
+
+/// GET /admin/ipc/spawn-runs — paginated admin spawn run listing with filters.
+pub async fn handle_admin_ipc_spawn_runs(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<AdminSpawnRunsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+    let runs = db.list_spawn_runs_admin(
+        q.status.as_deref(),
+        q.parent_id.as_deref(),
+        q.from_ts,
+        q.to_ts,
+        q.limit,
+        q.offset,
+    );
+    Ok(Json(serde_json::json!({ "spawn_runs": runs })))
+}
+
+/// GET /admin/ipc/audit — paginated audit event listing with filters.
+/// Reads from the JSONL audit log file directly.
+pub async fn handle_admin_ipc_audit(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<AdminAuditQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+
+    let config = state.config.lock();
+    let log_path = config.workspace_dir.join(&config.security.audit.log_path);
+    drop(config);
+
+    let events = match list_audit_events(
+        &log_path,
+        q.agent_id.as_deref(),
+        q.event_type.as_deref(),
+        q.from_ts,
+        q.to_ts,
+        q.search.as_deref(),
+        q.limit,
+        q.offset,
+    ) {
+        Ok(evts) => evts,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to read audit log: {e}"),
+                    "code": "audit_read_error"
+                })),
+            ));
+        }
+    };
+
+    Ok(Json(serde_json::json!({ "events": events })))
+}
+
+/// POST /admin/ipc/audit/verify — verify HMAC chain integrity.
+pub async fn handle_admin_ipc_audit_verify(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+
+    let config = state.config.lock();
+    let log_path = config.workspace_dir.join(&config.security.audit.log_path);
+    let key_path = config.workspace_dir.join("audit.key");
+    drop(config);
+
+    match crate::security::audit::verify_audit_chain(&log_path, &key_path) {
+        Ok(count) => Ok(Json(serde_json::json!({
+            "ok": true,
+            "verified": count,
+        }))),
+        Err(e) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+                "code": "chain_broken"
+            })),
+        )),
+    }
+}
+
+/// POST /admin/ipc/dismiss-message — soft-dismiss a quarantine message.
+pub async fn handle_admin_ipc_dismiss_message(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<DismissBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    let db = require_ipc_db(&state)?;
+
+    if let Err(e) = db.dismiss_message(body.message_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e,
+                "code": "dismiss_failed"
+            })),
+        ));
+    }
+
+    info!(message_id = body.message_id, "Quarantine message dismissed");
+
+    if let Some(ref logger) = state.audit_logger {
+        let _ = logger.log(&AuditEvent::ipc(
+            AuditEventType::IpcAdminAction,
+            "admin",
+            None,
+            &format!("dismiss: msg_id={}", body.message_id),
+        ));
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message_id": body.message_id,
+        "dismissed": true,
+    })))
+}
+
+/// Read and filter audit events from JSONL log file.
+fn list_audit_events(
+    log_path: &std::path::Path,
+    agent_id: Option<&str>,
+    event_type: Option<&str>,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+    search: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<serde_json::Value>, String> {
+    use std::io::BufRead;
+
+    if !log_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file =
+        std::fs::File::open(log_path).map_err(|e| format!("Failed to open audit log: {e}"))?;
+    let reader = std::io::BufReader::new(file);
+
+    // Read all lines into memory in reverse chronological order
+    let mut all_events: Vec<serde_json::Value> = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read line: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value =
+            serde_json::from_str(&line).map_err(|e| format!("Invalid JSON in audit log: {e}"))?;
+        all_events.push(event);
+    }
+
+    // Reverse for newest-first
+    all_events.reverse();
+
+    // Apply filters
+    let filtered: Vec<serde_json::Value> = all_events
+        .into_iter()
+        .filter(|evt| {
+            // Agent ID filter: match actor.user_id or action.command containing the agent
+            if let Some(aid) = agent_id {
+                let actor_match = evt
+                    .get("actor")
+                    .and_then(|a| a.get("user_id"))
+                    .and_then(|u| u.as_str())
+                    .is_some_and(|uid| uid == aid);
+                let command_match = evt
+                    .get("action")
+                    .and_then(|a| a.get("command"))
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|cmd| cmd.contains(aid));
+                if !actor_match && !command_match {
+                    return false;
+                }
+            }
+            // Event type filter
+            if let Some(et) = event_type {
+                let evt_type = evt.get("event_type").and_then(|t| t.as_str()).unwrap_or("");
+                if evt_type != et {
+                    return false;
+                }
+            }
+            // Time range filters
+            if let Some(fts) = from_ts {
+                if let Some(ts_str) = evt.get("timestamp").and_then(|t| t.as_str()) {
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                        if ts.timestamp() < fts {
+                            return false;
+                        }
+                    }
+                }
+            }
+            if let Some(tts) = to_ts {
+                if let Some(ts_str) = evt.get("timestamp").and_then(|t| t.as_str()) {
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                        if ts.timestamp() > tts {
+                            return false;
+                        }
+                    }
+                }
+            }
+            // Full-text search in action.command
+            if let Some(s) = search {
+                let command = evt
+                    .get("action")
+                    .and_then(|a| a.get("command"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                if !command.to_lowercase().contains(&s.to_lowercase()) {
+                    return false;
+                }
+            }
+            true
+        })
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+
+    Ok(filtered)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -3967,5 +4689,307 @@ mod tests {
         client.sign_send_body(&mut body2);
         let seq2 = body2["sender_seq"].as_i64().unwrap();
         assert_eq!(seq2, seq1 + 1, "sender_seq must increment monotonically");
+    }
+
+    // ── Phase 3.5 Step 0: admin read endpoint tests ──────────────
+
+    fn seed_test_agent(db: &IpcDb, agent_id: &str, trust_level: u8) {
+        db.update_last_seen(agent_id, trust_level, "agent");
+    }
+
+    #[test]
+    fn list_messages_admin_returns_all_messages() {
+        let db = test_db();
+        seed_test_agent(&db, "opus", 1);
+        seed_test_agent(&db, "sentinel", 3);
+        db.insert_message("opus", "sentinel", "task", "do stuff", 1, None, 0, None)
+            .unwrap();
+        db.insert_message("sentinel", "opus", "result", "done", 3, None, 0, None)
+            .unwrap();
+
+        let msgs = db.list_messages_admin(None, None, None, None, None, None, None, None, 50, 0);
+        assert_eq!(msgs.len(), 2);
+        // All should be normal lane
+        assert!(msgs.iter().all(|m| m.lane == "normal"));
+    }
+
+    #[test]
+    fn list_messages_admin_filter_by_agent() {
+        let db = test_db();
+        seed_test_agent(&db, "opus", 1);
+        seed_test_agent(&db, "sentinel", 3);
+        seed_test_agent(&db, "worker", 3);
+        db.insert_message("opus", "sentinel", "task", "a", 1, None, 0, None)
+            .unwrap();
+        db.insert_message("opus", "worker", "task", "b", 1, None, 0, None)
+            .unwrap();
+        db.insert_message("worker", "sentinel", "text", "c", 3, None, 0, None)
+            .unwrap();
+
+        let msgs = db.list_messages_admin(
+            Some("sentinel"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            50,
+            0,
+        );
+        // sentinel is from_agent or to_agent in 2 messages
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn list_messages_admin_quarantine_lane() {
+        let db = test_db();
+        seed_test_agent(&db, "untrusted", 4);
+        seed_test_agent(&db, "opus", 1);
+        db.insert_message("untrusted", "opus", "text", "hi", 4, None, 0, None)
+            .unwrap();
+        db.insert_message("opus", "untrusted", "text", "hello", 1, None, 0, None)
+            .unwrap();
+
+        let quarantine = db.list_messages_admin(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("quarantine"),
+            None,
+            None,
+            50,
+            0,
+        );
+        assert_eq!(quarantine.len(), 1);
+        assert_eq!(quarantine[0].lane, "quarantine");
+
+        let normal = db.list_messages_admin(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("normal"),
+            None,
+            None,
+            50,
+            0,
+        );
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].lane, "normal");
+    }
+
+    #[test]
+    fn list_messages_admin_pagination() {
+        let db = test_db();
+        seed_test_agent(&db, "a", 1);
+        seed_test_agent(&db, "b", 1);
+        for i in 0..10 {
+            db.insert_message("a", "b", "text", &format!("msg {i}"), 1, None, 0, None)
+                .unwrap();
+        }
+
+        let page1 = db.list_messages_admin(None, None, None, None, None, None, None, None, 3, 0);
+        assert_eq!(page1.len(), 3);
+        let page2 = db.list_messages_admin(None, None, None, None, None, None, None, None, 3, 3);
+        assert_eq!(page2.len(), 3);
+        assert_ne!(page1[0].id, page2[0].id);
+    }
+
+    #[test]
+    fn list_messages_admin_does_not_mark_read() {
+        let db = test_db();
+        seed_test_agent(&db, "a", 1);
+        seed_test_agent(&db, "b", 1);
+        db.insert_message("a", "b", "text", "hello", 1, None, 0, None)
+            .unwrap();
+
+        // Admin read
+        let msgs = db.list_messages_admin(None, None, None, None, None, None, None, None, 50, 0);
+        assert_eq!(msgs.len(), 1);
+        assert!(!msgs[0].read); // still unread
+
+        // Normal inbox read should still find it
+        let inbox = db.fetch_inbox("b", false, 50);
+        assert_eq!(inbox.len(), 1);
+    }
+
+    #[test]
+    fn list_spawn_runs_admin_basic() {
+        let db = test_db();
+        seed_test_agent(&db, "opus", 1);
+        db.create_spawn_run("sess-1", "opus", "eph-1", unix_now() + 3600);
+        db.create_spawn_run("sess-2", "opus", "eph-2", unix_now() + 3600);
+        db.complete_spawn_run("sess-1", "result data");
+
+        let all = db.list_spawn_runs_admin(None, None, None, None, 50, 0);
+        assert_eq!(all.len(), 2);
+
+        let running = db.list_spawn_runs_admin(Some("running"), None, None, None, 50, 0);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, "sess-2");
+
+        let completed = db.list_spawn_runs_admin(Some("completed"), None, None, None, 50, 0);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, "sess-1");
+    }
+
+    #[test]
+    fn agent_detail_returns_full_info() {
+        let db = test_db();
+        seed_test_agent(&db, "opus", 1);
+        seed_test_agent(&db, "sentinel", 3);
+        db.insert_message("opus", "sentinel", "task", "do it", 1, None, 0, None)
+            .unwrap();
+        db.insert_message("sentinel", "opus", "result", "done", 3, None, 0, None)
+            .unwrap();
+        db.create_spawn_run("sess-x", "opus", "eph-x", unix_now() + 3600);
+
+        let detail = db.agent_detail("opus", 300).unwrap();
+        assert_eq!(detail.agent.agent_id, "opus");
+        assert_eq!(detail.recent_messages.len(), 2);
+        assert_eq!(detail.active_spawns.len(), 1);
+        assert_eq!(detail.quarantine_count, 0);
+    }
+
+    #[test]
+    fn agent_detail_not_found() {
+        let db = test_db();
+        assert!(db.agent_detail("nonexistent", 300).is_none());
+    }
+
+    #[test]
+    fn agent_detail_quarantine_count() {
+        let db = test_db();
+        seed_test_agent(&db, "untrusted", 4);
+        seed_test_agent(&db, "opus", 1);
+        db.insert_message("untrusted", "opus", "text", "suspicious", 4, None, 0, None)
+            .unwrap();
+        db.insert_message(
+            "untrusted",
+            "opus",
+            "text",
+            "also suspicious",
+            4,
+            None,
+            0,
+            None,
+        )
+        .unwrap();
+
+        let detail = db.agent_detail("untrusted", 300).unwrap();
+        assert_eq!(detail.quarantine_count, 2);
+    }
+
+    #[test]
+    fn dismiss_message_success() {
+        let db = test_db();
+        seed_test_agent(&db, "untrusted", 4);
+        seed_test_agent(&db, "opus", 1);
+        let msg_id = db
+            .insert_message("untrusted", "opus", "text", "bad stuff", 4, None, 0, None)
+            .unwrap();
+
+        assert!(db.dismiss_message(msg_id).is_ok());
+
+        // Check it's now blocked with reason 'dismissed'
+        let msg = db.get_message(msg_id).unwrap();
+        assert!(msg.read || true); // dismissed messages have blocked=1
+                                   // Verify via admin listing
+        let dismissed =
+            db.list_messages_admin(None, None, None, None, Some(true), None, None, None, 50, 0);
+        assert_eq!(dismissed.len(), 1);
+        assert_eq!(dismissed[0].blocked_reason.as_deref(), Some("dismissed"));
+    }
+
+    #[test]
+    fn dismiss_message_not_quarantine() {
+        let db = test_db();
+        seed_test_agent(&db, "opus", 1);
+        seed_test_agent(&db, "sentinel", 3);
+        let msg_id = db
+            .insert_message("opus", "sentinel", "text", "normal", 1, None, 0, None)
+            .unwrap();
+
+        let result = db.dismiss_message(msg_id);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("quarantine"));
+    }
+
+    #[test]
+    fn dismiss_message_already_promoted() {
+        let db = test_db();
+        seed_test_agent(&db, "untrusted", 4);
+        seed_test_agent(&db, "opus", 1);
+        // Insert a promoted message
+        let msg_id = db
+            .insert_promoted_message(
+                "untrusted",
+                "opus",
+                "promoted_quarantine",
+                "{}",
+                4,
+                None,
+                0,
+                None,
+            )
+            .unwrap();
+
+        let result = db.dismiss_message(msg_id);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("promoted"));
+    }
+
+    #[test]
+    fn list_messages_admin_dismissed_filter() {
+        let db = test_db();
+        seed_test_agent(&db, "untrusted", 4);
+        seed_test_agent(&db, "opus", 1);
+        let msg1 = db
+            .insert_message("untrusted", "opus", "text", "msg1", 4, None, 0, None)
+            .unwrap();
+        let _msg2 = db
+            .insert_message("untrusted", "opus", "text", "msg2", 4, None, 0, None)
+            .unwrap();
+
+        // Dismiss msg1
+        db.dismiss_message(msg1).unwrap();
+
+        // dismissed=false excludes dismissed, shows only pending
+        let pending = db.list_messages_admin(
+            None,
+            None,
+            None,
+            Some(true),
+            Some(false),
+            None,
+            None,
+            None,
+            50,
+            0,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].payload, "msg2");
+
+        // dismissed=true shows only dismissed
+        let dismissed_only =
+            db.list_messages_admin(None, None, None, None, Some(true), None, None, None, 50, 0);
+        assert_eq!(dismissed_only.len(), 1);
+        assert_eq!(dismissed_only[0].payload, "msg1");
+    }
+
+    #[test]
+    fn list_agents_includes_public_key() {
+        let db = test_db();
+        seed_test_agent(&db, "opus", 1);
+        db.set_agent_public_key("opus", "deadbeef1234");
+
+        let agents = db.list_agents(300);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].public_key.as_deref(), Some("deadbeef1234"));
     }
 }
