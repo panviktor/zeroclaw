@@ -264,3 +264,99 @@ When `agents_ipc.enabled = true` and `broker_token` is set, these tools are regi
 | 2 | Team lead | text/task/query/result | Everything | `team:*` + below |
 | 3 | Worker | text ↑, query ↑, result ↑ (lateral text if allowlisted) | text/task/query | `public:*` + `agent:{self}:*` |
 | 4 | Restricted | text only → aliases | text only (quarantine lane) | `agent:{self}:*` only |
+
+---
+
+## Phase 3A: Ephemeral Spawn Workflow
+
+### Spawn and wait for result
+
+From an agent with IPC configured (broker_token set):
+
+```json
+{
+  "name": "agents_spawn",
+  "arguments": {
+    "prompt": "Analyze the top 5 Hacker News stories and summarize trends",
+    "wait": true,
+    "timeout": 300,
+    "trust_level": 3
+  }
+}
+```
+
+The tool will:
+1. Provision ephemeral identity from broker (`POST /api/ipc/provision-ephemeral`)
+2. Verify sandbox is available for the trust level (fail-closed)
+3. Launch child as a separate OS process with its own token
+4. Poll `GET /api/ipc/spawn-status` until completed or timeout
+5. Return the child's result payload
+
+### Fire-and-forget spawn
+
+```json
+{
+  "name": "agents_spawn",
+  "arguments": {
+    "prompt": "Clean up old log files in /tmp",
+    "wait": false,
+    "trust_level": 3
+  }
+}
+```
+
+Returns immediately with `session_id` — parent can poll status manually if needed.
+
+### Spawn with workload profile
+
+Define workload profiles in config:
+
+```toml
+[agents_ipc.workload_profiles.research]
+model = "claude-sonnet-4-6"
+allowed_tools = ["web_search", "web_fetch", "memory_read"]
+
+[agents_ipc.workload_profiles.code_review]
+model = "claude-opus-4-6"
+allowed_tools = ["shell", "file_read", "file_write"]
+```
+
+Then use in spawn:
+
+```json
+{
+  "name": "agents_spawn",
+  "arguments": {
+    "prompt": "Review the latest PR for security issues",
+    "wait": true,
+    "timeout": 600,
+    "workload": "code_review"
+  }
+}
+```
+
+### Sandbox enforcement
+
+Trust levels L2-L4 require a real sandbox backend. If the required sandbox is unavailable, spawn is **refused** — no fallback to NoopSandbox.
+
+| Trust | Required sandbox | NoopSandbox |
+|-------|-----------------|-------------|
+| L0-L1 | Optional | Allowed |
+| L2 | Landlock or Docker | Denied |
+| L3 | Bubblewrap, Landlock, or Docker | Denied |
+| L4 | Bubblewrap or Docker | Denied |
+
+### Ephemeral agent lifecycle
+
+```
+Parent: agents_spawn(wait=true) → provision → subprocess → poll
+Child:  [auto-configured via env vars] → runs → agents_reply(session_id, result)
+Broker: deliver to parent inbox + complete spawn_run + auto-revoke child token
+Parent: poll returns {status: "completed", result: "..."}
+```
+
+Child processes auto-configure IPC from environment variables set by the parent:
+- `ZEROCLAW_BROKER_TOKEN` — ephemeral bearer token
+- `ZEROCLAW_BROKER_URL` — broker gateway URL
+- `ZEROCLAW_AGENT_ID` — ephemeral agent identity
+- `ZEROCLAW_SESSION_ID` — spawn session for reply correlation

@@ -840,7 +840,34 @@ impl AgentsSpawnTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing session_id in provision response"))?;
 
-        // 2. Build env overlay for the child subprocess
+        // 2. Verify sandbox available for trust level (fail-closed)
+        let boundary = crate::security::execution::execution_boundary(child_level);
+        let sandbox = crate::security::detect::create_sandbox(&self.config.security);
+        if let Err(e) =
+            crate::security::execution::require_sandbox(child_level, &boundary, sandbox.as_ref())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Spawn refused: {e}")),
+            });
+        }
+
+        // 3. Validate workload profile if specified
+        if let Some(ref workload_name) = workload {
+            if let Some(profile) = self.config.agents_ipc.workload_profiles.get(workload_name) {
+                if let Err(e) = crate::security::execution::apply_workload(&boundary, profile) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Workload profile invalid: {e}")),
+                    });
+                }
+            }
+            // Unknown workload names are allowed — treated as label-only
+        }
+
+        // 4. Build env overlay for the child subprocess
         let mut env_overlay = std::collections::HashMap::new();
         env_overlay.insert(
             "ZEROCLAW_BROKER_URL".into(),
@@ -851,7 +878,7 @@ impl AgentsSpawnTool {
         env_overlay.insert("ZEROCLAW_SESSION_ID".into(), session_id.to_string());
         env_overlay.insert("ZEROCLAW_TIMEOUT_SECS".into(), timeout.to_string());
 
-        // 3. Create one-shot subprocess cron job
+        // 5. Create one-shot subprocess cron job
         let run_at = chrono::Utc::now() + chrono::Duration::seconds(1);
         let schedule = crate::cron::Schedule::At { at: run_at };
 
@@ -874,7 +901,7 @@ impl AgentsSpawnTool {
         )
         .map_err(|e| anyhow::anyhow!("Failed to create subprocess job: {e}"))?;
 
-        // 4. If wait=false, return immediately
+        // 6. If wait=false, return immediately
         if !wait {
             return Ok(ToolResult {
                 success: true,
@@ -892,7 +919,7 @@ impl AgentsSpawnTool {
             });
         }
 
-        // 5. Wait mode: poll spawn-status with exponential backoff
+        // 7. Wait mode: poll spawn-status with exponential backoff
         let mut delay_ms = POLL_INITIAL_MS;
         let deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_secs(u64::from(timeout));

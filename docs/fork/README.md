@@ -15,6 +15,7 @@ This directory contains the strategy, plans, and operational docs for the ZeroCl
 | [ipc-phase2-progress.md](ipc-phase2-progress.md) | Phase 2 execution checklist (8 steps) | Opus |
 | [ipc-quickstart.md](ipc-quickstart.md) | Minimal configs, pairing flow, smoke-test curl commands | Everyone |
 | [ipc-phase3-plan.md](ipc-phase3-plan.md) | Phase 3: Trusted Execution — ephemeral agents, fail-closed sandbox, subprocess isolation, crypto provenance | Everyone |
+| [ipc-phase3-progress.md](ipc-phase3-progress.md) | Phase 3A execution checklist (7 steps — DONE) | Opus |
 
 ## Reading order
 

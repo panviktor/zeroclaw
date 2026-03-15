@@ -39,8 +39,11 @@ Related documents:
 | IPC-008 | Approval broker via Opus / control plane / `#approvals` | `fork-only` | `high` | orchestration policy, channel integrations, audit events | Administrator + Opus | Authority boundary; critical not to mix with generic IPC |
 | IPC-009 | Structured IPC tracing events | `candidate-upstream` | `medium` | `src/gateway/ipc.rs`, tracing integration | Opus | Neutral observability layer |
 | IPC-010 | Agent IPC tools (`agents_list/send/inbox/reply/state/spawn`) | `candidate-upstream` | `medium` | `src/tools/agents_ipc.rs`, `src/tools/mod.rs` | Opus | Some parts may be upstreamable; the policy surface is not |
-| IPC-011 | Same-process `agents_spawn` with trust-by-convention | `fork-only` | `medium` | `src/tools/agents_ipc.rs`, `src/cron/*` | Opus | Temporary solution until a real isolation model exists |
+| IPC-011 | ~~Same-process `agents_spawn`~~ → Subprocess spawn with broker-backed identity | `fork-only` | `high` | `src/tools/agents_ipc.rs`, `src/cron/*` | Opus | Phase 3A: subprocess execution, ephemeral identity, wait/poll |
 | IPC-012 | Config masking/encryption for IPC secrets | `candidate-upstream` | `medium` | `src/gateway/api.rs`, `src/config/schema.rs` | Opus | Good generic hardening |
+| IPC-013 | Ephemeral identity provisioning + spawn_runs table | `fork-only` | `high` | `src/gateway/ipc.rs`, `src/security/pairing.rs` | Opus | Phase 3A: runtime-only tokens, spawn session tracking, auto-revoke |
+| IPC-014 | Child process IPC bootstrap via env vars | `candidate-upstream` | `low` | `src/config/schema.rs`, `src/agent/prompt.rs` | Opus | Env-based IPC auto-config — useful as generic mechanism |
+| IPC-015 | Fail-closed execution profiles + workload profiles | `fork-only` | `high` | `src/security/execution.rs`, `src/config/schema.rs` | Opus | Phase 3A: trust-derived sandbox enforcement, no NoopSandbox fallback for L2+ |
 
 ## Shared Hotspots
 
@@ -52,6 +55,7 @@ These files should automatically go onto the manual review list for every sync P
 - `src/security/pairing.rs`
 - `src/tools/mod.rs`
 - `src/onboard/wizard.rs`
+- `src/security/execution.rs`
 - if IPC touches scheduler / channels: `src/cron/*`, `src/channels/*`, `src/agent/*`
 
 ## Review Rules
