@@ -166,6 +166,10 @@ enum Commands {
         #[arg(long)]
         reinit: bool,
 
+        /// Run the full interactive setup wizard
+        #[arg(long)]
+        interactive: bool,
+
         /// Reconfigure channels only (fast repair flow)
         #[arg(long)]
         channels_only: bool,
@@ -325,11 +329,12 @@ override with --tz and an IANA timezone name.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
+  zeroclaw cron add '*/5 * * * *' 'echo ok'
+  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
+  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
   zeroclaw cron pause <task-id>
   zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
@@ -738,6 +743,7 @@ async fn main() -> Result<()> {
     if let Commands::Onboard {
         force,
         reinit,
+        interactive,
         channels_only,
         api_key,
         provider,
@@ -747,6 +753,7 @@ async fn main() -> Result<()> {
     {
         let force = *force;
         let reinit = *reinit;
+        let interactive = *interactive;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
@@ -755,6 +762,14 @@ async fn main() -> Result<()> {
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
+        }
+        if interactive && channels_only {
+            bail!("--interactive and --channels-only cannot be used together");
+        }
+        if interactive
+            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
+        {
+            bail!("--interactive does not accept --api-key, --provider, --model, or --memory");
         }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
@@ -808,6 +823,8 @@ async fn main() -> Result<()> {
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
+        } else if interactive {
+            Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -2237,6 +2254,17 @@ mod tests {
 
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_accepts_interactive_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
             other => panic!("expected onboard command, got {other:?}"),
         }
     }
